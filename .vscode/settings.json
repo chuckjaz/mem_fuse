@@ -1,0 +1,33 @@
+{
+    "cSpell.words": [
+        "bkuptime",
+        "blksize",
+        "chgtime",
+        "crtime",
+        "EEXIST",
+        "ENOENT",
+        "ENOSYS",
+        "ENOTDIR",
+        "fsyncdir",
+        "fuser",
+        "getattr",
+        "getxattr",
+        "indexmap",
+        "libc",
+        "listxattr",
+        "mknod",
+        "newparent",
+        "nlink",
+        "nlookup",
+        "opendir",
+        "rdev",
+        "readlink",
+        "releasedir",
+        "removexattr",
+        "setattr",
+        "setxattr",
+        "statfs",
+        "threadpool",
+        "Xattr"
+    ]
+}
