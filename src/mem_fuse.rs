@@ -5,6 +5,8 @@ use std::{
 use indexmap::IndexMap;
 use fuser::{self, FileAttr, Filesystem, TimeOrNow};
 use libc::{c_int, EEXIST, ENOENT, ENOTDIR, ENOSYS};
+#[cfg(target_os = "linux")]
+use libc::RENAME_NOREPLACE;
 use log::debug;
 
 type Result<T> = std::result::Result<T, c_int>;
@@ -369,26 +371,28 @@ impl MemoryFuse {
         name: &OsStr,
         newparent: u64,
         newname: &OsStr,
+        flags: u32,
     ) -> Result<()> {
-        if parent == newparent {
-            let dir = self.nodes.get_dir_mut(parent)?;
-            if dir.has(newname) { Err(EEXIST)? }
-            let ino = dir.remove(name)?;
-            dir.insert(newname, ino)
-        } else {
-            if self.nodes.has_dir_with(newparent, newname)? {
-                // Don't try to remove if we will fail the insert
-                Err(EEXIST)?
-            }
-            let ino = {
-                let parent_dir = self.nodes.get_dir_mut(parent)?;
-                parent_dir.remove(name)?
-            };
+        let allow_overwrite = {
+            #[cfg(target_os = "linux")]
             {
-                let new_parent_dir = self.nodes.get_dir_mut(newparent)?;
-                new_parent_dir.insert(newname, ino)
+                (flags & RENAME_NOREPLACE) == 0
             }
+            #[cfg(not(target_os = "linux"))]
+            {
+                flags == 0
+            }
+        };
+
+        if self.nodes.has_dir_with(newparent, newname)? {
+            if !allow_overwrite {
+                return Err(EEXIST);
+            }
+            self.unlink_node(newparent, newname)?;
         }
+
+        let ino = self.nodes.get_dir_mut(parent)?.remove(name)?;
+        self.nodes.get_dir_mut(newparent)?.insert(newname, ino)
     }
 
     fn read_file(&mut self, ino: u64, offset: i64, size: u32) -> Result<&[u8]>{
@@ -597,7 +601,7 @@ impl Filesystem for MemoryFuse {
              reply: fuser::ReplyEmpty,
     ) {
         debug!("rename(parent: {parent}, name: {name:?}, newparent: {newparent}, newname: {newname:?}, flags: {flags}");
-        match self.rename_node(parent, name, newparent, newname) {
+        match self.rename_node(parent, name, newparent, newname, flags) {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(log_err("rename", err)),
         }
