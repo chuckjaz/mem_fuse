@@ -6,7 +6,7 @@ use indexmap::IndexMap;
 use fuser::{self, FileAttr, Filesystem, TimeOrNow};
 use libc::{c_int, EEXIST, ENOENT, ENOTDIR, ENOSYS};
 #[cfg(target_os = "linux")]
-use libc::RENAME_NOREPLACE;
+use libc::{RENAME_NOREPLACE, RENAME_EXCHANGE};
 use log::debug;
 use users::{get_current_gid, get_current_uid};
 
@@ -23,6 +23,10 @@ impl Directory {
 
     fn get(&self, name: &OsStr) -> Option<u64> {
         self.entries.get(name).copied()
+    }
+
+    fn set(&mut self, name: &OsStr, ino: u64) -> Result<Option<u64>> {
+        Ok(self.entries.insert(name.into(), ino))
     }
 
     fn insert(&mut self, name: &OsStr, ino: u64) -> Result<()> {
@@ -384,16 +388,46 @@ impl MemoryFuse {
                 flags == 0
             }
         };
+        let exchange = {
+            #[cfg(target_os = "linux")]
+            {
+                (flags & RENAME_EXCHANGE) != 0
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                false
+            }
+        };
 
         if self.nodes.has_dir_with(newparent, newname)? {
             if !allow_overwrite {
+                // The newname must not exist
                 return Err(EEXIST);
             }
             self.unlink_node(newparent, newname)?;
+        } else {
+            // The target must exist
+            return Err(ENOENT)?
         }
 
-        let ino = self.nodes.get_dir_mut(parent)?.remove(name)?;
-        self.nodes.get_dir_mut(newparent)?.insert(newname, ino)
+        if exchange {
+            let name_ino = self.nodes.find(parent, name)?.attr.ino;
+            let newname_ino = self.nodes.find(newparent, newname)?.attr.ino;
+
+            // The next to operations cannot fail as they have been validated by the previous
+            // two calls. However, if they do we should panic as it will result in an inconsistent
+            // file system.
+            {
+                self.nodes.get_dir_mut(parent).unwrap().set(name, newname_ino).unwrap();
+            }
+            {
+                self.nodes.get_dir_mut(newparent).unwrap().set(newname, name_ino).unwrap();
+            }
+            Ok(())
+        } else {
+            let ino = self.nodes.get_dir_mut(parent)?.remove(name)?;
+            self.nodes.get_dir_mut(newparent)?.insert(newname, ino)
+        }
     }
 
     fn read_file(&mut self, ino: u64, offset: i64, size: u32) -> Result<&[u8]>{
