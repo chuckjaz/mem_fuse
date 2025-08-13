@@ -254,19 +254,18 @@ impl MemoryFuse {
     ) -> Result<FileAttr> {
         let node = self.nodes.get_mut(ino)?;
         let mut attr = node.attr;
-        mode.map(move |mode| { attr.perm = mode as u16 });
-        uid.map(|uid| { attr.uid = uid });
-        gid.map(|gid| { attr.gid = gid });
-        atime.map(|atime| { attr.atime = atime.to_time() });
-        mtime.map(|mtime| { attr.mtime = mtime.to_time() });
-        ctime.map(|ctime| { attr.ctime = ctime });
-        flags.map(|flags| { attr.flags = flags });
-        let _ = size.map(|size| {
+        if let Some(mode) = mode { attr.perm = mode as u16; }
+        if let Some(uid) = uid { attr.uid = uid; }
+        if let Some(gid) = gid { attr.gid = gid; }
+        if let Some(atime) = atime { attr.atime = atime.to_time(); }
+        if let Some(mtime) = mtime { attr.mtime = mtime.to_time(); }
+        if let Some(ctime) = ctime { attr.ctime = ctime; }
+        if let Some(flags) = flags { attr.flags = flags; }
+        if let Some(size) = size {
             let data = node.get_data_mut()?;
             data.resize(size as usize, 0u8);
             attr.size = size;
-            Result::<()>::Ok(())
-        });
+        }
         node.attr = attr;
         Ok(attr)
     }
@@ -449,10 +448,7 @@ impl Filesystem for MemoryFuse {
         debug!("lookup(parent: {parent}, name {name:?})");
         match self.lookup_node(parent, name) {
             Ok(attr) => reply.entry(&MEM_TTL, &attr, 1),
-            Err(err) => {
-                debug!("lookup(parent: {parent}, name: {name:?} failed - {err}");
-                reply.error(err)
-            },
+            Err(err) => { reply.error(log_err("lookup", err)); },
         }
     }
 
@@ -461,10 +457,7 @@ impl Filesystem for MemoryFuse {
     fn getattr(&mut self, _req: &fuser::Request<'_>, ino: u64, _fh: Option<u64>, reply: fuser::ReplyAttr) {
         match self.get_attr(ino) {
             Ok(attr) => reply.attr(&MEM_TTL, &attr),
-            Err(err) => {
-                debug!("getattr(ino: {ino}, failed - {err}");
-                reply.error(err)
-            }
+            Err(err) => { reply.error(log_err("getattr", err)) },
         }
     }
 
@@ -488,7 +481,7 @@ impl Filesystem for MemoryFuse {
         ) {
             match self.set_attr(ino, mode, uid, gid, size, atime, mtime, ctime, flags) {
                 Ok(attr) => reply.attr(&MEM_TTL, &attr),
-                Err(err) => reply.error(err),
+                Err(err) => reply.error(log_err("setattr", err)),
             }
         }
 
@@ -496,7 +489,7 @@ impl Filesystem for MemoryFuse {
     fn readlink(&mut self, _req: &fuser::Request<'_>, ino: u64, reply: fuser::ReplyData) {
         match self.read_link(ino) {
             Ok(data) => reply.data(data),
-            Err(err) => reply.error(err),
+            Err(err) => reply.error(log_err("readlink", err)),
         }
     }
 
@@ -513,7 +506,7 @@ impl Filesystem for MemoryFuse {
         debug!("mknod(parent: {parent}, name: {name:?}, mode: {mode}, umask: {umask}, rdev: {rdev}");
         match self.make_file(parent, name, mode, req.uid(), req.gid()) {
             Ok(attr) => reply.entry(&MEM_TTL, &attr, 1),
-            Err(err) => reply.error(err),
+            Err(err) => reply.error(log_err("mknod", err)),
         }
     }
 
@@ -529,7 +522,7 @@ impl Filesystem for MemoryFuse {
         debug!("mkdir(parent: {parent}, name: {name:?}, mode: {mode}, umask: {umask}");
         match self.make_directory(parent, name, mode, req.uid(), req.gid()) {
             Ok(attr) => reply.entry(&MEM_TTL, &attr, 1),
-            Err(err) => reply.error(err),
+            Err(err) => reply.error(log_err("mkdir", err)),
         }
     }
 
@@ -544,7 +537,7 @@ impl Filesystem for MemoryFuse {
         debug!("symlink(parent: {parent}, link_name: {link_name:?}, target: {target:?}");
         match self.make_symbolic_link(parent, link_name, target, req.uid(), req.gid()) {
             Ok(attr) => reply.entry(&MEM_TTL, &attr, 1),
-            Err(err) => reply.error(err),
+            Err(err) => reply.error(log_err("symlink", err)),
         }
     }
 
@@ -561,7 +554,7 @@ impl Filesystem for MemoryFuse {
         debug!("create(parent: {parent}, name: {name:?}, mode: {mode}, umask: {umask}");
         match self.make_file(parent, name, mode, req.uid(), req.gid()) {
             Ok(attr) => reply.created(&MEM_TTL, &attr, 1, 0, flags as u32),
-            Err(err) => reply.error(err),
+            Err(err) => reply.error(log_err("create", err)),
         }
     }
 
@@ -576,7 +569,7 @@ impl Filesystem for MemoryFuse {
         debug!("unlink(ino: {ino}, new_parent: {new_parent}, new_name: {new_name:?})");
         match self.link_node(ino, new_parent, new_name) {
             Ok(attr) => reply.entry(&MEM_TTL, &attr, 1),
-            Err(err) => reply.error(err),
+            Err(err) => reply.error(log_err("link", err)),
         }
     }
 
@@ -584,7 +577,7 @@ impl Filesystem for MemoryFuse {
         debug!("unlink(parent: {parent}, name: {name:?})");
         match self.unlink_node(parent, name) {
             Ok(()) => reply.ok(),
-            Err(err) => reply.error(err),
+            Err(err) => reply.error(log_err("unlink", err)),
         }
      }
 
@@ -606,7 +599,7 @@ impl Filesystem for MemoryFuse {
         debug!("rename(parent: {parent}, name: {name:?}, newparent: {newparent}, newname: {newname:?}, flags: {flags}");
         match self.rename_node(parent, name, newparent, newname) {
             Ok(()) => reply.ok(),
-            Err(err) => reply.error(err),
+            Err(err) => reply.error(log_err("rename", err)),
         }
     }
 
@@ -628,7 +621,7 @@ impl Filesystem for MemoryFuse {
         debug!("read(ino: {ino}, fh: {fh}, offset: {offset}, size: {size}, flags: {flags}, lock_owner: {lock_owner:?})");
         match self.read_file(ino, offset, size) {
             Ok(data) => reply.data(data),
-            Err(err) => reply.error(err),
+            Err(err) => reply.error(log_err("read", err)),
         }
     }
 
@@ -647,7 +640,7 @@ impl Filesystem for MemoryFuse {
         debug!("write(ino: {ino}, fh: {fh}, offset: {offset}, write_flags: {write_flags}, lock_owner: {lock_owner:?})");
         match self.write_file(ino, offset, new_data) {
             Ok(len) => reply.written(len as u32),
-            Err(err) => reply.error(err),
+            Err(err) => reply.error(log_err("write", err)),
         }
     }
 
@@ -686,30 +679,22 @@ impl Filesystem for MemoryFuse {
         debug!("readdir(ino: {ino}, fh: {fh}, offset: {offset})");
         match self.read_directory(ino) {
             Ok(iter) => {
-                debug!("readdir({ino}) - iter");
                 let mut current = 0;
                 for (name, attr_result) in iter {
                     if attr_result.is_err() {
-                        debug!("readdir({ino}) - skipping {name:?}");
                         continue
                     }
                     current += 1;
                     if current >= offset {
                         let attr = attr_result.unwrap();
-                            debug!("readdir({ino}) - adding {name:?}");
                         if reply.add(attr.ino, current + 1, attr.kind, name) {
-                            debug!("readdir({ino}) - stopping at {name:?}");
                             break
                         }
                     }
                 }
-                debug!("readdir({ino}) - ok");
                 reply.ok();
             },
-            Err(err) => {
-                debug!("readdir({ino}) - err({err})");
-                reply.error(err)
-            },
+            Err(err) => { reply.error(log_err("readdir", err)) },
         }
     }
 
@@ -808,6 +793,11 @@ impl Filesystem for MemoryFuse {
         reply.error(ENOSYS);
     }
 
+}
+
+fn log_err(msg: &str, err: c_int) -> c_int {
+    debug!("{msg} failed -> err: {err}");
+    err
 }
 
 fn new_attr(
