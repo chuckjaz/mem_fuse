@@ -8,6 +8,7 @@ use libc::{c_int, EEXIST, ENOENT, ENOTDIR, ENOSYS};
 #[cfg(target_os = "linux")]
 use libc::RENAME_NOREPLACE;
 use log::debug;
+use users::{get_current_gid, get_current_uid};
 
 type Result<T> = std::result::Result<T, c_int>;
 
@@ -217,7 +218,7 @@ pub struct MemoryFuse {
 
 impl MemoryFuse {
     pub fn new() -> MemoryFuse {
-        let attr = new_attr(1, fuser::FileType::Directory,0o777, 0, 0);
+        let attr = new_attr(1, fuser::FileType::Directory,0o755, get_current_uid(), get_current_gid());
         let mut nodes = Nodes::new();
         let root = Node::new_directory(attr);
         let _ = nodes.insert(root);

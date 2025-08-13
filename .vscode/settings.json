@@ -19,6 +19,7 @@
         "newparent",
         "nlink",
         "nlookup",
+        "NOREPLACE",
         "opendir",
         "rdev",
         "readlink",
