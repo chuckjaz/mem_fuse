@@ -202,7 +202,7 @@ impl DiskImageWorker {
                     };
 
                     if let Ok(node) = nodes.get(ino) {
-                        if let NodeKind::File { content: FileContent::Dirty(data) } = &node.kind {
+                        if let NodeKind::File { content: FileContent::InMemory(data) } = &node.kind {
                             (path, Some(data.clone()))
                         } else {
                             (path, None)
@@ -220,7 +220,7 @@ impl DiskImageWorker {
                     let mut nodes = nodes.write().unwrap();
                     if let Ok(node) = nodes.get_mut(ino) {
                         if let NodeKind::File { content } = &mut node.kind {
-                            if let FileContent::Dirty(current_data) = &*content {
+                            if let FileContent::InMemory(current_data) = &*content {
                                 if current_data.as_slice() == data.as_slice() {
                                     *content = FileContent::OnDisk;
                                 }
