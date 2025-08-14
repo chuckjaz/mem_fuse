@@ -300,8 +300,10 @@ impl DiskImageWorker {
         self.work_queue.clone()
     }
 
-    pub fn stop(&mut self) {
-        drop(self.work_queue.clone());
+    pub fn stop(mut self) {
+        // By taking ownership of self, the work_queue sender is dropped when
+        // this function returns, which will cause the worker thread to exit.
+        drop(self.work_queue);
         if let Some(worker_thread) = self.worker_thread.take() {
             worker_thread.join().unwrap();
         }
