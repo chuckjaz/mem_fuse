@@ -1,4 +1,5 @@
 use std::{
+    fmt::Debug,
     fs,
     os::unix::fs::{chown, symlink, PermissionsExt},
     path::{Path, PathBuf},
@@ -38,7 +39,6 @@ impl DiskImage {
     }
 }
 
-#[derive(Debug)]
 pub enum WriteJob {
     CreateFile {
         path: PathBuf,
@@ -73,6 +73,22 @@ pub enum WriteJob {
         source_path: PathBuf,
         link_path: PathBuf,
     },
+}
+
+impl Debug for WriteJob {
+    // Implemented explicitly to avoid writing large Vec<u8> to logs.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CreateFile { path, attr } => f.debug_struct("CreateFile").field("path", path).field("attr", attr).finish(),
+            Self::CreateDir { path, attr } => f.debug_struct("CreateDir").field("path", path).field("attr", attr).finish(),
+            Self::CreateSymlink { path, target, attr } => f.debug_struct("CreateSymlink").field("path", path).field("target", target).field("attr", attr).finish(),
+            Self::Write { ino, path, data: _ } => f.debug_struct("Write").field("ino", ino).field("path", path).finish(),
+            Self::SetAttr { path, attr } => f.debug_struct("SetAttr").field("path", path).field("attr", attr).finish(),
+            Self::Delete { path } => f.debug_struct("Delete").field("path", path).finish(),
+            Self::Rename { old_path, new_path } => f.debug_struct("Rename").field("old_path", old_path).field("new_path", new_path).finish(),
+            Self::Link { source_path, link_path } => f.debug_struct("Link").field("source_path", source_path).field("link_path", link_path).finish(),
+        }
+    }
 }
 
 pub struct DiskImageWorker {
