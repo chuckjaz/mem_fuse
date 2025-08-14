@@ -9,24 +9,8 @@ use libc::{RENAME_NOREPLACE, RENAME_EXCHANGE};
 use log::{debug, info};
 use users::{get_current_gid, get_current_uid};
 
-use crate::disk_image::{DiskImageWorker, WriteJob};
+use crate::disk_image::{build_path, DiskImageWorker, WriteJob};
 use crate::node::{FileContent, Node, NodeKind, Nodes};
-
-fn build_path(nodes: &Nodes, ino: u64) -> Result<PathBuf> {
-    if ino == 1 {
-        // Root directory
-        return Ok(PathBuf::new());
-    }
-
-    if let Some(parents) = nodes.get_parents(ino) {
-        if let Some((parent_ino, name)) = parents.first() {
-            let parent_path = build_path(nodes, *parent_ino)?;
-            return Ok(parent_path.join(name));
-        }
-    }
-
-    Err(ENOENT)
-}
 
 pub(crate) type Result<T> = std::result::Result<T, c_int>;
 
@@ -91,9 +75,8 @@ impl MemoryFuse {
     ) -> Result<FileAttr> {
         let path = {
             let nodes = self.nodes.read().unwrap();
-            build_path(&nodes, ino).unwrap()
+            build_path(&nodes, ino).ok()
         };
-
         let mut nodes = self.nodes.write().unwrap();
         let node = nodes.get_mut(ino)?;
         let mut attr = node.attr;
@@ -128,7 +111,7 @@ impl MemoryFuse {
                             .as_ref()
                             .unwrap()
                             .image()
-                            .get_fs_path(&path);
+                            .get_fs_path(&path.unwrap());
                         let new_data = fs::read(fs_path).unwrap_or_default();
                         *content = FileContent::InMemory(new_data);
                         if let FileContent::InMemory(data) = content {
@@ -147,7 +130,7 @@ impl MemoryFuse {
         if let Some(worker) = &self.disk_worker {
             worker
                 .sender()
-                .send(WriteJob::SetAttr { path, attr })
+                .send(WriteJob::SetAttr { ino, attr })
                 .unwrap();
         }
 
@@ -180,10 +163,9 @@ impl MemoryFuse {
         dir.insert(name, attr.ino)?;
         nodes.add_parent(attr.ino, parent, name);
         if let Some(worker) = &self.disk_worker {
-            let path = build_path(&nodes, attr.ino).unwrap();
             worker
                 .sender()
-                .send(WriteJob::CreateFile { path, attr })
+                .send(WriteJob::CreateFile { parent, name: name.to_owned(), attr })
                 .unwrap();
         }
         let node = Node::new_file(attr);
@@ -209,10 +191,9 @@ impl MemoryFuse {
         dir.insert(name, attr.ino)?;
         nodes.add_parent(attr.ino, parent, name);
         if let Some(worker) = &self.disk_worker {
-            let path = build_path(&nodes, attr.ino).unwrap();
             worker
                 .sender()
-                .send(WriteJob::CreateDir { path, attr })
+                .send(WriteJob::CreateDir { parent, name: name.to_owned(), attr })
                 .unwrap();
         }
         let node = Node::new_directory(attr);
@@ -238,11 +219,11 @@ impl MemoryFuse {
         dir.insert(link_name, attr.ino)?;
         nodes.add_parent(attr.ino, parent, link_name);
         if let Some(worker) = &self.disk_worker {
-            let path = build_path(&nodes, attr.ino).unwrap();
             worker
                 .sender()
                 .send(WriteJob::CreateSymlink {
-                    path,
+                    parent,
+                    name: link_name.to_owned(),
                     target: target.to_path_buf(),
                     attr,
                 })
@@ -268,14 +249,12 @@ impl MemoryFuse {
             dir.insert(new_name, ino)?;
             nodes.add_parent(ino, new_parent, new_name);
             if let Some(worker) = &self.disk_worker {
-                let source_path = build_path(&nodes, ino).unwrap();
-                let new_parent_path = build_path(&nodes, new_parent).unwrap();
-                let link_path = new_parent_path.join(new_name);
                 worker
                     .sender()
                     .send(WriteJob::Link {
-                        source_path,
-                        link_path,
+                        ino,
+                        new_parent,
+                        new_name: new_name.to_owned(),
                     })
                     .unwrap();
             }
@@ -293,14 +272,13 @@ impl MemoryFuse {
             let dir = nodes.get_dir_mut(parent)?;
             dir.remove(name)?
         };
-        let parent_path = build_path(&nodes, parent).unwrap();
-        let path_to_delete = parent_path.join(name);
         nodes.remove_parent(ino, parent, name);
         if let Some(worker) = &self.disk_worker {
             worker
                 .sender()
                 .send(WriteJob::Delete {
-                    path: path_to_delete,
+                    parent,
+                    name: name.to_owned(),
                 })
                 .unwrap();
         }
@@ -379,13 +357,14 @@ impl MemoryFuse {
         nodes.add_parent(old_ino, newparent, newname);
 
         if let Some(worker) = &self.disk_worker {
-            let old_parent_path = build_path(&nodes, parent).unwrap();
-            let old_path = old_parent_path.join(name);
-            let new_parent_path = build_path(&nodes, newparent).unwrap();
-            let new_path = new_parent_path.join(newname);
             worker
                 .sender()
-                .send(WriteJob::Rename { old_path, new_path })
+                .send(WriteJob::Rename {
+                    parent,
+                    name: name.to_owned(),
+                    new_parent: newparent,
+                    new_name: newname.to_owned(),
+                })
                 .unwrap();
         }
 
@@ -395,7 +374,7 @@ impl MemoryFuse {
     fn read_file(&mut self, ino: u64, offset: i64, size: u32) -> Result<Vec<u8>> {
         let path = {
             let nodes = self.nodes.read().unwrap();
-            build_path(&nodes, ino).unwrap()
+            build_path(&nodes, ino).ok()
         };
         let mut nodes = self.nodes.write().unwrap();
         let node = nodes.get_mut(ino)?;
@@ -408,7 +387,7 @@ impl MemoryFuse {
                         .as_ref()
                         .unwrap()
                         .image()
-                        .get_fs_path(&path);
+                        .get_fs_path(&path.unwrap());
                     let new_data = fs::read(fs_path).unwrap_or_default();
                     *content = FileContent::InMemory(new_data);
                     if let FileContent::InMemory(data) = content {
@@ -433,7 +412,7 @@ impl MemoryFuse {
     fn write_file(&mut self, ino: u64, offset: i64, new_data: &[u8]) -> Result<usize> {
         let path = {
             let nodes = self.nodes.read().unwrap();
-            build_path(&nodes, ino).unwrap()
+            build_path(&nodes, ino).ok()
         };
         let mut nodes = self.nodes.write().unwrap();
         let node = nodes.get_mut(ino)?;
@@ -447,7 +426,7 @@ impl MemoryFuse {
                             .as_ref()
                             .unwrap()
                             .image()
-                            .get_fs_path(&path);
+                            .get_fs_path(&path.unwrap());
                         let new_data = fs::read(fs_path).unwrap_or_default();
                         *content = FileContent::InMemory(new_data);
                         if let FileContent::InMemory(data) = content {
@@ -476,11 +455,7 @@ impl MemoryFuse {
                     let new_content = FileContent::Dirty(data.clone());
                     worker
                         .sender()
-                        .send(WriteJob::Write {
-                            ino,
-                            path: path.clone(),
-                            data: data.clone(),
-                        })
+                        .send(WriteJob::Write { ino })
                         .unwrap();
                     *content = new_content;
                 }
