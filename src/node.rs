@@ -149,13 +149,35 @@ impl Node {
 
 pub struct Nodes {
     nodes: HashMap<u64, Node>,
+    parents: HashMap<u64, Vec<(u64, OsString)>>,
 }
 
 impl Nodes {
     pub fn new() -> Self {
         Self {
             nodes: HashMap::new(),
+            parents: HashMap::new(),
         }
+    }
+
+    pub fn add_parent(&mut self, ino: u64, parent: u64, name: &OsStr) {
+        self.parents
+            .entry(ino)
+            .or_default()
+            .push((parent, name.to_os_string()));
+    }
+
+    pub fn remove_parent(&mut self, ino: u64, parent: u64, name: &OsStr) {
+        if let Some(parents) = self.parents.get_mut(&ino) {
+            parents.retain(|(p_ino, p_name)| *p_ino != parent || p_name != name);
+            if parents.is_empty() {
+                self.parents.remove(&ino);
+            }
+        }
+    }
+
+    pub fn get_parents(&self, ino: u64) -> Option<&Vec<(u64, OsString)>> {
+        self.parents.get(&ino)
     }
 
     pub fn insert(&mut self, mut node: Node) -> Result<FileAttr> {
@@ -203,11 +225,6 @@ impl Nodes {
     pub fn get_dir_mut(&mut self, ino: u64) -> Result<&mut Directory> {
         let node = self.get_mut(ino)?;
         node.get_dir_mut()
-    }
-
-    pub fn has_dir_with(&mut self, ino: u64, name: &OsStr) -> Result<bool> {
-        let dir = self.get_dir(ino)?;
-        Ok(dir.has(name))
     }
 
     pub fn find(&mut self, parent: u64, name: &OsStr) -> Result<&Node> {
