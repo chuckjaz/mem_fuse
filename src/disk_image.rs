@@ -231,7 +231,11 @@ impl DiskImageWorker {
                     if let Ok(node) = nodes.get_mut(ino) {
                         if let NodeKind::File(file) = &mut node.kind {
                             if !file.dirty {
-                                file.content = FileContent::OnDisk;
+                                if let FileContent::InMemory(current_data) = &file.content {
+                                    if Arc::ptr_eq(&data, current_data) {
+                                        file.content = FileContent::OnDisk;
+                                    }
+                                }
                             }
                         }
                     }
