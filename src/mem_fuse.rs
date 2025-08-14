@@ -1,307 +1,46 @@
 use std::{
-    collections::HashMap, ffi::{OsStr, OsString}, fs, os::unix::ffi::OsStrExt, path::{Path, PathBuf}, sync::{atomic::{AtomicUsize, Ordering}, mpsc::{self, Sender}, Arc, RwLock}, thread::{self, JoinHandle}, time::SystemTime, u32
+    ffi::{OsStr, OsString}, os::unix::ffi::OsStrExt, path::{Path, PathBuf}, sync::{atomic::{AtomicUsize, Ordering}, Arc, RwLock}, time::SystemTime, u32
 };
 
-use indexmap::IndexMap;
 use fuser::{self, FileAttr, Filesystem, TimeOrNow};
-use libc::{c_int, EEXIST, ENOENT, ENOTDIR, ENOSYS};
+use libc::{c_int, EEXIST, ENOENT, ENOSYS};
 #[cfg(target_os = "linux")]
 use libc::{RENAME_NOREPLACE, RENAME_EXCHANGE};
 use log::{debug, info};
 use users::{get_current_gid, get_current_uid};
 
-type Result<T> = std::result::Result<T, c_int>;
+use crate::disk_image::{DiskImageWorker, WriteJob};
+use crate::node::{FileContent, Node, NodeKind, Nodes};
 
-struct Directory {
-    entries: IndexMap<OsString, u64>
-}
-
-impl Directory {
-    fn new() -> Self {
-        Self { entries: IndexMap::new()}
-    }
-
-    fn get(&self, name: &OsStr) -> Option<u64> {
-        self.entries.get(name).copied()
-    }
-
-    fn set(&mut self, name: &OsStr, ino: u64) -> Result<Option<u64>> {
-        Ok(self.entries.insert(name.into(), ino))
-    }
-
-    fn insert(&mut self, name: &OsStr, ino: u64) -> Result<()> {
-        if self.has(name) {
-            Err(EEXIST)
-        } else {
-            self.entries.insert(name.into(), ino);
-            Ok(())
-        }
-    }
-
-    fn remove(&mut self, name: &OsStr) -> Result<u64> {
-        self.entries.swap_remove(name).or_error(ENOENT)
-    }
-
-    fn has(&self, name: &OsStr) -> bool {
-        self.entries.contains_key(name)
-    }
-
-    fn iter(&self) -> indexmap::map::Iter<'_, OsString, u64> {
-        self.entries.iter()
-    }
-}
-
-#[derive(Debug, Clone)]
-struct DiskImage {
-    base_path: PathBuf,
-}
-
-impl DiskImage {
-    fn new(base_path: PathBuf) -> Self {
-        if !base_path.exists() {
-            info!("Creating disk image path at {:?}", base_path);
-            fs::create_dir_all(&base_path).unwrap();
-        }
-        Self { base_path }
-    }
-
-    fn path_for_ino(&self, ino: u64) -> PathBuf {
-        self.base_path.join(ino.to_string())
-    }
-
-    fn write(&self, ino: u64, data: &[u8]) -> std::io::Result<()> {
-        info!("Writing to disk ino: {ino}");
-        fs::write(self.path_for_ino(ino), data)
-    }
-
-    fn read(&self, ino: u64) -> std::io::Result<Vec<u8>> {
-        info!("Reading from disk ino: {ino}");
-        fs::read(self.path_for_ino(ino))
-    }
-
-    fn remove(&self, ino: u64) -> std::io::Result<()> {
-        info!("Removing from disk ino: {ino}");
-        fs::remove_file(self.path_for_ino(ino))
-    }
-}
-
-enum FileContent {
-    InMemory(Vec<u8>),
-    OnDisk,
-    Dirty(Vec<u8>),
-}
-
-enum WriteJob {
-    Write { ino: u64, data: Vec<u8> },
-    Delete { ino: u64 },
-}
-
-enum NodeKind {
-    File { content: FileContent },
-    Directory { dir: Directory },
-    SymbolicLink { target: PathBuf },
-}
-
-struct Node {
-    kind: NodeKind,
-    attr: FileAttr,
-}
-
-impl Node {
-    fn new_file(attr: FileAttr) -> Self {
-        Self { attr, kind: NodeKind::File { content: FileContent::InMemory(Vec::new()) } }
-    }
-
-    fn new_directory(attr: FileAttr) -> Self {
-        Self { attr, kind: NodeKind::Directory { dir: Directory::new() } }
-    }
-
-    fn new_symbolic_link(attr: FileAttr, target: &Path) -> Self {
-        Self { attr, kind: NodeKind::SymbolicLink { target: target.to_path_buf() } }
-    }
-
-    fn get_target(&mut self) -> Result<&Path> {
-        self.accessed();
-        match &self.kind {
-            NodeKind::SymbolicLink { target } => {
-                Ok(target)
-            }
-            _ => Err(ENOENT)
-        }
-    }
-
-    fn get_dir(&mut self) -> Result<&Directory> {
-        self.accessed();
-        match &self.kind {
-            NodeKind::Directory { dir  } => {
-                Ok(dir)
-            },
-            _ => Err(ENOTDIR)
-        }
-    }
-
-    fn get_dir_mut(&mut self) -> Result<&mut Directory> {
-        self.written();
-        match &mut self.kind {
-            NodeKind::Directory { dir } => {
-                Ok(dir)
-            },
-            _ => Err(ENOTDIR)
-        }
-    }
-
-    fn add_link(&mut self) {
-        self.attr.nlink += 1
-    }
-
-    fn release(&mut self) -> bool {
-        let new_count = self.attr.nlink - 1;
-        self.attr.nlink = new_count;
-        new_count == 0
-    }
-
-    fn accessed(&mut self) {
-        self.attr.atime = SystemTime::now()
-    }
-
-    fn written(&mut self) {
-        self.accessed();
-        self.attr.mtime = SystemTime::now()
-    }
-}
-
-struct Nodes {
-    nodes: HashMap<u64, Node>
-}
-
-impl Nodes {
-    fn new() -> Self {
-        Self { nodes: HashMap::new() }
-    }
-
-    fn insert(&mut self, mut node: Node) -> Result<FileAttr> {
-        let ino = node.attr.ino;
-        node.add_link();
-        let attr = node.attr;
-        self.nodes.insert(ino, node);
-        Ok(attr)
-    }
-
-    fn dec_link(&mut self, ino: u64) -> Result<()> {
-        let node = self.get_mut(ino)?;
-        if node.release() {
-            self.nodes.remove(&ino);
-        }
-        Ok(())
-    }
-
-    fn get(&self, ino: u64) -> Result<&Node> {
-        if let Some(node) = self.nodes.get(&ino) {
-            Ok(node)
-        } else {
-            Err(ENOENT)
-        }
-    }
-
-    fn get_mut(&mut self, ino: u64) -> Result<&mut Node> {
-        self.nodes.get_mut(&ino).or_error(ENOENT)
-    }
-
-    fn get_dir(&mut self, ino: u64) -> Result<&Directory> {
-        let node = self.get_mut(ino)?;
-        node.get_dir()
-
-    }
-
-    fn get_dir_anon(&self, ino: u64) -> Result<&Directory> {
-        let node = self.get(ino)?;
-        if let NodeKind::Directory { dir } = &node.kind {
-            Ok(dir)
-        } else {
-            Err(ENOTDIR)
-        }
-    }
-
-    fn get_dir_mut(&mut self, ino: u64) -> Result<&mut Directory> {
-        let node = self.get_mut(ino)?;
-        node.get_dir_mut()
-
-    }
-
-    fn has_dir_with(&mut self, ino: u64, name: &OsStr) -> Result<bool> {
-        let dir = self.get_dir(ino)?;
-        Ok(dir.has(name))
-    }
-
-    fn find(&mut self, parent: u64, name: &OsStr) -> Result<&Node> {
-        let dir = self.get_dir(parent)?;
-        let ino = dir.get(name).or_error(ENOENT)?;
-        self.get(ino)
-    }
-}
+pub(crate) type Result<T> = std::result::Result<T, c_int>;
 
 pub struct MemoryFuse {
     nodes: Arc<RwLock<Nodes>>,
     next_ino: AtomicUsize,
-    disk_image: Option<DiskImage>,
-    work_queue: Option<Sender<WriteJob>>,
-    worker_thread: Option<JoinHandle<()>>,
+    disk_worker: Option<DiskImageWorker>,
 }
 
 impl MemoryFuse {
     pub fn new(disk_image_path: Option<PathBuf>) -> MemoryFuse {
-        let attr = new_attr(1, fuser::FileType::Directory,0o755, get_current_uid(), get_current_gid());
+        let attr = new_attr(
+            1,
+            fuser::FileType::Directory,
+            0o755,
+            get_current_uid(),
+            get_current_gid(),
+        );
         let mut nodes = Nodes::new();
         let root = Node::new_directory(attr);
         let _ = nodes.insert(root);
         let nodes = Arc::new(RwLock::new(nodes));
 
-        let (disk_image, work_queue, worker_thread) = if let Some(path) = disk_image_path {
-            let disk_image = DiskImage::new(path);
-            let (tx, rx) = mpsc::channel::<WriteJob>();
-
-            let worker_nodes = Arc::clone(&nodes);
-            let worker_disk_image = disk_image.clone();
-
-            let worker_thread = thread::spawn(move || {
-                for job in rx {
-                    match job {
-                        WriteJob::Write { ino, data } => {
-                            if let Err(e) = worker_disk_image.write(ino, &data) {
-                                debug!("Failed to write {ino} to disk: {e:?}");
-                                continue;
-                            }
-                            let mut nodes = worker_nodes.write().unwrap();
-                            if let Ok(node) = nodes.get_mut(ino) {
-                                if let NodeKind::File { content } = &mut node.kind {
-                                    if let FileContent::Dirty(mem_data) = content {
-                                        if mem_data.as_slice() == data.as_slice() {
-                                            *content = FileContent::OnDisk;
-                                        }
-                                    }
-                                }
-                            }
-                        },
-                        WriteJob::Delete { ino } => {
-                            if let Err(e) = worker_disk_image.remove(ino) {
-                                debug!("Failed to remove {ino} from disk: {e:?}");
-                            }
-                        }
-                    }
-                }
-            });
-
-            (Some(disk_image), Some(tx), Some(worker_thread))
-        } else {
-            (None, None, None)
-        };
+        let disk_worker =
+            disk_image_path.map(|path| DiskImageWorker::new(path, Arc::clone(&nodes)));
 
         Self {
             nodes,
             next_ino: AtomicUsize::new(2),
-            disk_image,
-            work_queue,
-            worker_thread,
+            disk_worker,
         }
     }
 
@@ -332,24 +71,44 @@ impl MemoryFuse {
         atime: Option<fuser::TimeOrNow>,
         mtime: Option<fuser::TimeOrNow>,
         ctime: Option<SystemTime>,
-        flags: Option<u32>
+        flags: Option<u32>,
     ) -> Result<FileAttr> {
         let mut nodes = self.nodes.write().unwrap();
         let node = nodes.get_mut(ino)?;
         let mut attr = node.attr;
-        if let Some(mode) = mode { attr.perm = mode as u16; }
-        if let Some(uid) = uid { attr.uid = uid; }
-        if let Some(gid) = gid { attr.gid = gid; }
-        if let Some(atime) = atime { attr.atime = atime.to_time(); }
-        if let Some(mtime) = mtime { attr.mtime = mtime.to_time(); }
-        if let Some(ctime) = ctime { attr.ctime = ctime; }
-        if let Some(flags) = flags { attr.flags = flags; }
+        if let Some(mode) = mode {
+            attr.perm = mode as u16;
+        }
+        if let Some(uid) = uid {
+            attr.uid = uid;
+        }
+        if let Some(gid) = gid {
+            attr.gid = gid;
+        }
+        if let Some(atime) = atime {
+            attr.atime = atime.to_time();
+        }
+        if let Some(mtime) = mtime {
+            attr.mtime = mtime.to_time();
+        }
+        if let Some(ctime) = ctime {
+            attr.ctime = ctime;
+        }
+        if let Some(flags) = flags {
+            attr.flags = flags;
+        }
         if let Some(size) = size {
             if let NodeKind::File { content } = &mut node.kind {
                 let data = match content {
                     FileContent::Dirty(data) | FileContent::InMemory(data) => data,
                     FileContent::OnDisk => {
-                        let new_data = self.disk_image.as_ref().unwrap().read(ino).unwrap_or_default();
+                        let new_data = self
+                            .disk_worker
+                            .as_ref()
+                            .unwrap()
+                            .image()
+                            .read(ino)
+                            .unwrap_or_default();
                         *content = FileContent::InMemory(new_data);
                         if let FileContent::InMemory(data) = content {
                             data
@@ -464,8 +223,8 @@ impl MemoryFuse {
             let dir = nodes.get_dir_mut(parent)?;
             dir.remove(name)?
         };
-        if let Some(work_queue) = &self.work_queue {
-            work_queue.send(WriteJob::Delete { ino }).unwrap();
+        if let Some(worker) = &self.disk_worker {
+            worker.sender().send(WriteJob::Delete { ino }).unwrap();
         }
         nodes.dec_link(ino)
     }
@@ -536,14 +295,20 @@ impl MemoryFuse {
         }
     }
 
-    fn read_file(&mut self, ino: u64, offset: i64, size: u32) -> Result<Vec<u8>>{
+    fn read_file(&mut self, ino: u64, offset: i64, size: u32) -> Result<Vec<u8>> {
         let mut nodes = self.nodes.write().unwrap();
         let node = nodes.get_mut(ino)?;
         if let NodeKind::File { content } = &mut node.kind {
             let data = match content {
                 FileContent::Dirty(data) | FileContent::InMemory(data) => data,
                 FileContent::OnDisk => {
-                    let new_data = self.disk_image.as_ref().unwrap().read(ino).unwrap_or_default();
+                    let new_data = self
+                        .disk_worker
+                        .as_ref()
+                        .unwrap()
+                        .image()
+                        .read(ino)
+                        .unwrap_or_default();
                     *content = FileContent::InMemory(new_data);
                     if let FileContent::InMemory(data) = content {
                         data
@@ -572,7 +337,13 @@ impl MemoryFuse {
                 let data = match content {
                     FileContent::Dirty(data) | FileContent::InMemory(data) => data,
                     FileContent::OnDisk => {
-                        let new_data = self.disk_image.as_ref().unwrap().read(ino).unwrap_or_default();
+                        let new_data = self
+                            .disk_worker
+                            .as_ref()
+                            .unwrap()
+                            .image()
+                            .read(ino)
+                            .unwrap_or_default();
                         *content = FileContent::InMemory(new_data);
                         if let FileContent::InMemory(data) = content {
                             data
@@ -596,9 +367,15 @@ impl MemoryFuse {
                     data.resize(new_size, 0u8);
                 }
                 data[effective_offset..effective_size].copy_from_slice(new_data);
-                if let Some(work_queue) = &self.work_queue {
+                if let Some(worker) = &self.disk_worker {
                     let new_content = FileContent::Dirty(data.clone());
-                    work_queue.send(WriteJob::Write { ino, data: data.clone() }).unwrap();
+                    worker
+                        .sender()
+                        .send(WriteJob::Write {
+                            ino,
+                            data: data.clone(),
+                        })
+                        .unwrap();
                     *content = new_content;
                 }
                 new_size
@@ -630,11 +407,8 @@ impl Filesystem for MemoryFuse {
 
     fn destroy(&mut self) {
         info!("destroying");
-        if let Some(work_queue) = self.work_queue.take() {
-            drop(work_queue);
-        }
-        if let Some(worker_thread) = self.worker_thread.take() {
-            worker_thread.join().unwrap();
+        if let Some(mut worker) = self.disk_worker.take() {
+            worker.stop();
         }
     }
 
@@ -1031,6 +805,7 @@ impl ToSystemTime for TimeOrNow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::time::Duration;
     use std::thread::sleep;
     use tempfile::tempdir;
@@ -1106,7 +881,7 @@ fn min(a: usize, b: usize) -> usize {
     if a < b { a } else { b }
 }
 
-trait OrError<R> {
+pub(crate) trait OrError<R> {
     fn or_error(self, err: c_int) -> Result<R>;
 }
 

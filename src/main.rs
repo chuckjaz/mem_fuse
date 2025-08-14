@@ -4,7 +4,9 @@ use log::info;
 use std::error::Error;
 use std::{ffi::OsString, path::{Path, PathBuf}};
 use std::result::Result;
+mod disk_image;
 mod mem_fuse;
+mod node;
 
 #[derive(Debug, Parser)]
 #[command(name = "inv-fuse")]
