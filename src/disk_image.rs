@@ -212,16 +212,18 @@ impl DiskImageWorker {
                 };
 
                 if let Some(data) = data_to_write {
-                    let fs_path = disk_image.get_fs_path(&path);
-                    let file = fs::OpenOptions::new().write(true).open(&fs_path)?;
-                    let data = data.read().unwrap();
-                    for (start, end) in regions {
-                        let start = start as usize;
-                        let end = end as usize;
-                        if end > data.len() {
-                            continue;
+                    {
+                        let fs_path = disk_image.get_fs_path(&path);
+                        let file = fs::OpenOptions::new().write(true).open(&fs_path)?;
+                        let data = data.read().unwrap();
+                        for (start, end) in regions {
+                            let start = start as usize;
+                            let end = end as usize;
+                            if end > data.len() {
+                                continue;
+                            }
+                            file.write_all_at(&data[start..end], start as u64)?;
                         }
-                        file.write_all_at(&data[start..end], start as u64)?;
                     }
 
                     // Now re-acquire lock to update state
