@@ -1,5 +1,5 @@
 use std::{
-    ffi::{OsStr, OsString}, os::unix::ffi::OsStrExt, path::{Path, PathBuf}, sync::{atomic::{AtomicUsize, Ordering}, Arc, RwLock}, time::SystemTime, u32
+    ffi::{OsStr, OsString}, fs, os::unix::ffi::OsStrExt, path::{Path, PathBuf}, sync::{atomic::{AtomicUsize, Ordering}, Arc, RwLock}, time::SystemTime, u32
 };
 
 use fuser::{self, FileAttr, Filesystem, TimeOrNow};
@@ -11,6 +11,22 @@ use users::{get_current_gid, get_current_uid};
 
 use crate::disk_image::{DiskImageWorker, WriteJob};
 use crate::node::{FileContent, Node, NodeKind, Nodes};
+
+fn build_path(nodes: &Nodes, ino: u64) -> Result<PathBuf> {
+    if ino == 1 {
+        // Root directory
+        return Ok(PathBuf::new());
+    }
+
+    if let Some(parents) = nodes.get_parents(ino) {
+        if let Some((parent_ino, name)) = parents.first() {
+            let parent_path = build_path(nodes, *parent_ino)?;
+            return Ok(parent_path.join(name));
+        }
+    }
+
+    Err(ENOENT)
+}
 
 pub(crate) type Result<T> = std::result::Result<T, c_int>;
 
@@ -73,6 +89,11 @@ impl MemoryFuse {
         ctime: Option<SystemTime>,
         flags: Option<u32>,
     ) -> Result<FileAttr> {
+        let path = {
+            let nodes = self.nodes.read().unwrap();
+            build_path(&nodes, ino).unwrap()
+        };
+
         let mut nodes = self.nodes.write().unwrap();
         let node = nodes.get_mut(ino)?;
         let mut attr = node.attr;
@@ -102,13 +123,13 @@ impl MemoryFuse {
                 let data = match content {
                     FileContent::Dirty(data) | FileContent::InMemory(data) => data,
                     FileContent::OnDisk => {
-                        let new_data = self
+                        let fs_path = self
                             .disk_worker
                             .as_ref()
                             .unwrap()
                             .image()
-                            .read(ino)
-                            .unwrap_or_default();
+                            .get_fs_path(&path);
+                        let new_data = fs::read(fs_path).unwrap_or_default();
                         *content = FileContent::InMemory(new_data);
                         if let FileContent::InMemory(data) = content {
                             data
@@ -122,6 +143,14 @@ impl MemoryFuse {
             }
         }
         node.attr = attr;
+
+        if let Some(worker) = &self.disk_worker {
+            worker
+                .sender()
+                .send(WriteJob::SetAttr { path, attr })
+                .unwrap();
+        }
+
         Ok(attr)
     }
 
@@ -149,6 +178,14 @@ impl MemoryFuse {
         let mut nodes = self.nodes.write().unwrap();
         let dir = nodes.get_dir_mut(parent)?;
         dir.insert(name, attr.ino)?;
+        nodes.add_parent(attr.ino, parent, name);
+        if let Some(worker) = &self.disk_worker {
+            let path = build_path(&nodes, attr.ino).unwrap();
+            worker
+                .sender()
+                .send(WriteJob::CreateFile { path, attr })
+                .unwrap();
+        }
         let node = Node::new_file(attr);
         nodes.insert(node)
     }
@@ -170,6 +207,14 @@ impl MemoryFuse {
         let mut nodes = self.nodes.write().unwrap();
         let dir = nodes.get_dir_mut(parent)?;
         dir.insert(name, attr.ino)?;
+        nodes.add_parent(attr.ino, parent, name);
+        if let Some(worker) = &self.disk_worker {
+            let path = build_path(&nodes, attr.ino).unwrap();
+            worker
+                .sender()
+                .send(WriteJob::CreateDir { path, attr })
+                .unwrap();
+        }
         let node = Node::new_directory(attr);
         nodes.insert(node)
     }
@@ -191,6 +236,18 @@ impl MemoryFuse {
         let mut nodes = self.nodes.write().unwrap();
         let dir = nodes.get_dir_mut(parent)?;
         dir.insert(link_name, attr.ino)?;
+        nodes.add_parent(attr.ino, parent, link_name);
+        if let Some(worker) = &self.disk_worker {
+            let path = build_path(&nodes, attr.ino).unwrap();
+            worker
+                .sender()
+                .send(WriteJob::CreateSymlink {
+                    path,
+                    target: target.to_path_buf(),
+                    attr,
+                })
+                .unwrap();
+        }
         let node = Node::new_symbolic_link(attr, target);
         nodes.insert(node)
     }
@@ -209,6 +266,19 @@ impl MemoryFuse {
         {
             let dir = nodes.get_dir_mut(new_parent)?;
             dir.insert(new_name, ino)?;
+            nodes.add_parent(ino, new_parent, new_name);
+            if let Some(worker) = &self.disk_worker {
+                let source_path = build_path(&nodes, ino).unwrap();
+                let new_parent_path = build_path(&nodes, new_parent).unwrap();
+                let link_path = new_parent_path.join(new_name);
+                worker
+                    .sender()
+                    .send(WriteJob::Link {
+                        source_path,
+                        link_path,
+                    })
+                    .unwrap();
+            }
         }
         {
             let node = nodes.get_mut(ino)?;
@@ -223,8 +293,16 @@ impl MemoryFuse {
             let dir = nodes.get_dir_mut(parent)?;
             dir.remove(name)?
         };
+        let parent_path = build_path(&nodes, parent).unwrap();
+        let path_to_delete = parent_path.join(name);
+        nodes.remove_parent(ino, parent, name);
         if let Some(worker) = &self.disk_worker {
-            worker.sender().send(WriteJob::Delete { ino }).unwrap();
+            worker
+                .sender()
+                .send(WriteJob::Delete {
+                    path: path_to_delete,
+                })
+                .unwrap();
         }
         nodes.dec_link(ino)
     }
@@ -260,55 +338,78 @@ impl MemoryFuse {
 
         let mut nodes = self.nodes.write().unwrap();
 
-        if nodes.has_dir_with(newparent, newname)? {
-            if !allow_overwrite {
-                // The newname must not exist
-                return Err(EEXIST);
-            }
-            let ino = {
-                let dir = nodes.get_dir_mut(newparent)?;
-                dir.remove(newname)?
-            };
-            nodes.dec_link(ino)?;
-        } else {
-            // The target must exist
-            return Err(ENOENT)?
-        }
+        let old_ino = match nodes.get_dir(parent)?.get(name) {
+            Some(ino) => ino,
+            None => return Err(ENOENT),
+        };
 
         if exchange {
-            let name_ino = nodes.find(parent, name)?.attr.ino;
-            let newname_ino = nodes.find(newparent, newname)?.attr.ino;
+            let new_ino = match nodes.get_dir(newparent)?.get(newname) {
+                Some(ino) => ino,
+                None => return Err(ENOENT),
+            };
 
-            // The next to operations cannot fail as they have been validated by the previous
-            // two calls. However, if they do we should panic as it will result in an inconsistent
-            // file system.
-            {
-                nodes.get_dir_mut(parent).unwrap().set(name, newname_ino).unwrap();
-            }
-            {
-                nodes.get_dir_mut(newparent).unwrap().set(newname, name_ino).unwrap();
-            }
-            Ok(())
-        } else {
-            let ino = nodes.get_dir_mut(parent)?.remove(name)?;
-            nodes.get_dir_mut(newparent)?.insert(newname, ino)
+            // Atomically swap entries
+            nodes.get_dir_mut(parent).unwrap().set(name, new_ino).unwrap();
+            nodes.remove_parent(old_ino, parent, name);
+            nodes.add_parent(new_ino, parent, name);
+
+            nodes.get_dir_mut(newparent).unwrap().set(newname, old_ino).unwrap();
+            nodes.remove_parent(new_ino, newparent, newname);
+            nodes.add_parent(old_ino, newparent, newname);
+
+            return Ok(());
         }
+
+        // Not an exchange, regular rename
+        if let Some(existing_ino) = nodes.get_dir(newparent)?.get(newname) {
+            if !allow_overwrite {
+                return Err(EEXIST);
+            }
+            // Unlink the existing destination
+            nodes.get_dir_mut(newparent)?.remove(newname)?;
+            nodes.remove_parent(existing_ino, newparent, newname);
+            nodes.dec_link(existing_ino)?;
+        }
+
+        // Move the source to the new destination
+        nodes.get_dir_mut(parent)?.remove(name)?;
+        nodes.remove_parent(old_ino, parent, name);
+        nodes.get_dir_mut(newparent)?.insert(newname, old_ino)?;
+        nodes.add_parent(old_ino, newparent, newname);
+
+        if let Some(worker) = &self.disk_worker {
+            let old_parent_path = build_path(&nodes, parent).unwrap();
+            let old_path = old_parent_path.join(name);
+            let new_parent_path = build_path(&nodes, newparent).unwrap();
+            let new_path = new_parent_path.join(newname);
+            worker
+                .sender()
+                .send(WriteJob::Rename { old_path, new_path })
+                .unwrap();
+        }
+
+        Ok(())
     }
 
     fn read_file(&mut self, ino: u64, offset: i64, size: u32) -> Result<Vec<u8>> {
+        let path = {
+            let nodes = self.nodes.read().unwrap();
+            build_path(&nodes, ino).unwrap()
+        };
         let mut nodes = self.nodes.write().unwrap();
         let node = nodes.get_mut(ino)?;
         if let NodeKind::File { content } = &mut node.kind {
             let data = match content {
                 FileContent::Dirty(data) | FileContent::InMemory(data) => data,
                 FileContent::OnDisk => {
-                    let new_data = self
+                    let fs_path = self
                         .disk_worker
                         .as_ref()
                         .unwrap()
                         .image()
-                        .read(ino)
-                        .unwrap_or_default();
+                        .get_fs_path(&path);
+                    let new_data = fs::read(fs_path).unwrap_or_default();
                     *content = FileContent::InMemory(new_data);
                     if let FileContent::InMemory(data) = content {
                         data
@@ -330,6 +431,10 @@ impl MemoryFuse {
     }
 
     fn write_file(&mut self, ino: u64, offset: i64, new_data: &[u8]) -> Result<usize> {
+        let path = {
+            let nodes = self.nodes.read().unwrap();
+            build_path(&nodes, ino).unwrap()
+        };
         let mut nodes = self.nodes.write().unwrap();
         let node = nodes.get_mut(ino)?;
         let new_size = {
@@ -337,13 +442,13 @@ impl MemoryFuse {
                 let data = match content {
                     FileContent::Dirty(data) | FileContent::InMemory(data) => data,
                     FileContent::OnDisk => {
-                        let new_data = self
+                        let fs_path = self
                             .disk_worker
                             .as_ref()
                             .unwrap()
                             .image()
-                            .read(ino)
-                            .unwrap_or_default();
+                            .get_fs_path(&path);
+                        let new_data = fs::read(fs_path).unwrap_or_default();
                         *content = FileContent::InMemory(new_data);
                         if let FileContent::InMemory(data) = content {
                             data
@@ -373,6 +478,7 @@ impl MemoryFuse {
                         .sender()
                         .send(WriteJob::Write {
                             ino,
+                            path: path.clone(),
                             data: data.clone(),
                         })
                         .unwrap();
@@ -806,68 +912,113 @@ impl ToSystemTime for TimeOrNow {
 mod tests {
     use super::*;
     use std::fs;
-    use std::time::Duration;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
     use std::thread::sleep;
+    use std::time::Duration;
     use tempfile::tempdir;
 
+    fn wait_for_path(path: &Path, should_exist: bool) {
+        for _ in 0..30 {
+            if path.exists() == should_exist {
+                return;
+            }
+            sleep(Duration::from_millis(100));
+        }
+        panic!(
+            "Timeout waiting for path {:?} to {}exist",
+            path,
+            if should_exist { "" } else { "not " }
+        );
+    }
+
     #[test]
-    fn test_write_behind_cache() {
+    fn test_disk_mirroring() {
         let dir = tempdir().unwrap();
-        let cache_path = dir.path().to_path_buf();
+        let image_path = dir.path().to_path_buf();
+        let mut fuse = MemoryFuse::new(Some(image_path.clone()));
 
-        let mut fuse = MemoryFuse::new(Some(cache_path.clone()));
+        // 1. Create a directory
+        let dir_name = OsStr::new("mydir");
+        let dir_attr = fuse
+            .make_directory(1, dir_name, 0o755, 1001, 1002)
+            .unwrap();
 
-        let parent_ino = 1;
+        let on_disk_dir_path = image_path.join("mydir");
+        wait_for_path(&on_disk_dir_path, true);
+
+        assert!(on_disk_dir_path.is_dir());
+        let metadata = on_disk_dir_path.metadata().unwrap();
+        assert_eq!(metadata.mode() & 0o777, 0o755);
+        // Note: UID/GID checks might fail if not run as root
+        // assert_eq!(metadata.uid(), 1001);
+        // assert_eq!(metadata.gid(), 1002);
+
+        // 2. Create a file inside the directory
         let file_name = OsStr::new("test.txt");
-        let file_attr = fuse.make_file(parent_ino, file_name, 0o644, 1000, 1000).unwrap();
+        let file_attr = fuse
+            .make_file(dir_attr.ino, file_name, 0o644, 1003, 1004)
+            .unwrap();
         let file_ino = file_attr.ino;
 
+        let on_disk_file_path = on_disk_dir_path.join("test.txt");
+        wait_for_path(&on_disk_file_path, true);
+        let metadata = on_disk_file_path.metadata().unwrap();
+        assert_eq!(metadata.mode() & 0o777, 0o644);
+        // assert_eq!(metadata.uid(), 1003);
+        // assert_eq!(metadata.gid(), 1004);
+
+        // 3. Write to the file
         let data = b"hello world";
         fuse.write_file(file_ino, 0, data).unwrap();
 
-        let on_disk_path = cache_path.join(file_ino.to_string());
-        let mut found = false;
-        for _ in 0..20 {
-            if on_disk_path.exists() {
-                found = true;
-                break;
-            }
-            sleep(Duration::from_millis(100));
-        }
-        assert!(found, "File was not written to disk in time");
-
-        let on_disk_data = fs::read(&on_disk_path).unwrap();
-        assert_eq!(on_disk_data, data);
-
         let mut is_on_disk = false;
         for _ in 0..20 {
-            let nodes = fuse.nodes.read().unwrap();
-            let node = nodes.get(file_ino).unwrap();
-            if let NodeKind::File { content } = &node.kind {
-                if let FileContent::OnDisk = content {
-                    is_on_disk = true;
-                    break;
+            let on_disk_data = fs::read(&on_disk_file_path).unwrap_or_default();
+            if on_disk_data == data {
+                let nodes = fuse.nodes.read().unwrap();
+                let node = nodes.get(file_ino).unwrap();
+                if let NodeKind::File { content } = &node.kind {
+                    if let FileContent::OnDisk = content {
+                        is_on_disk = true;
+                        break;
+                    }
                 }
             }
-            drop(nodes);
             sleep(Duration::from_millis(100));
         }
-        assert!(is_on_disk, "File did not transition to OnDisk state");
+        assert!(is_on_disk, "File write not completed or state not updated");
 
-        let read_data = fuse.read_file(file_ino, 0, data.len() as u32).unwrap();
-        assert_eq!(read_data, data);
+        // 4. Rename the file
+        let new_file_name = OsStr::new("renamed.txt");
+        fuse.rename_node(dir_attr.ino, file_name, dir_attr.ino, new_file_name, 0)
+            .unwrap();
 
-        fuse.unlink_node(parent_ino, file_name).unwrap();
+        let new_on_disk_file_path = on_disk_dir_path.join("renamed.txt");
+        wait_for_path(&on_disk_file_path, true);
+        wait_for_path(&on_disk_file_path, false);
+        assert!(!on_disk_file_path.exists());
+        assert!(new_on_disk_file_path.is_file());
 
-        let mut deleted = false;
-        for _ in 0..20 {
-            if !on_disk_path.exists() {
-                deleted = true;
-                break;
-            }
-            sleep(Duration::from_millis(100));
-        }
-        assert!(deleted, "File was not deleted from disk in time");
+        // 5. Create a hard link
+        let link_name = OsStr::new("link.txt");
+        fuse.link_node(file_ino, 1, link_name).unwrap();
+        let on_disk_link_path = image_path.join("link.txt");
+        wait_for_path(&on_disk_link_path, true);
+        assert!(on_disk_link_path.is_file());
+
+        let meta1 = new_on_disk_file_path.metadata().unwrap();
+        let meta2 = on_disk_link_path.metadata().unwrap();
+        assert_eq!(meta1.ino(), meta2.ino());
+
+        // 6. Unlink the original file
+        fuse.unlink_node(dir_attr.ino, new_file_name).unwrap();
+        wait_for_path(&new_on_disk_file_path, false);
+        assert!(on_disk_link_path.is_file());
+
+        // 7. Unlink the link
+        fuse.unlink_node(1, link_name).unwrap();
+        wait_for_path(&on_disk_link_path, false);
     }
 }
 
