@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsString,
     fmt::Debug,
     fs,
     os::unix::fs::{chown, symlink, PermissionsExt},
@@ -11,9 +12,28 @@ use std::{
 };
 
 use fuser::FileAttr;
+use libc::{c_int, ENOENT};
 use log::{debug, info};
 
 use crate::node::{FileContent, NodeKind, Nodes};
+
+pub(crate) type Result<T> = std::result::Result<T, c_int>;
+
+pub fn build_path(nodes: &Nodes, ino: u64) -> Result<PathBuf> {
+    if ino == 1 {
+        // Root directory
+        return Ok(PathBuf::new());
+    }
+
+    if let Some(parents) = nodes.get_parents(ino) {
+        if let Some((parent_ino, name)) = parents.first() {
+            let parent_path = build_path(nodes, *parent_ino)?;
+            return Ok(parent_path.join(name));
+        }
+    }
+
+    Err(ENOENT)
+}
 
 #[derive(Debug, Clone)]
 pub struct DiskImage {
@@ -41,37 +61,42 @@ impl DiskImage {
 
 pub enum WriteJob {
     CreateFile {
-        path: PathBuf,
+        parent: u64,
+        name: OsString,
         attr: FileAttr,
     },
     CreateDir {
-        path: PathBuf,
+        parent: u64,
+        name: OsString,
         attr: FileAttr,
     },
     CreateSymlink {
-        path: PathBuf,
+        parent: u64,
+        name: OsString,
         target: PathBuf,
         attr: FileAttr,
     },
     Write {
         ino: u64,
-        path: PathBuf,
-        data: Vec<u8>,
     },
     SetAttr {
-        path: PathBuf,
+        ino: u64,
         attr: FileAttr,
     },
     Delete {
-        path: PathBuf,
+        parent: u64,
+        name: OsString,
     },
     Rename {
-        old_path: PathBuf,
-        new_path: PathBuf,
+        parent: u64,
+        name: OsString,
+        new_parent: u64,
+        new_name: OsString,
     },
     Link {
-        source_path: PathBuf,
-        link_path: PathBuf,
+        ino: u64,
+        new_parent: u64,
+        new_name: OsString,
     },
 }
 
@@ -79,14 +104,14 @@ impl Debug for WriteJob {
     // Implemented explicitly to avoid writing large Vec<u8> to logs.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::CreateFile { path, attr } => f.debug_struct("CreateFile").field("path", path).field("attr", attr).finish(),
-            Self::CreateDir { path, attr } => f.debug_struct("CreateDir").field("path", path).field("attr", attr).finish(),
-            Self::CreateSymlink { path, target, attr } => f.debug_struct("CreateSymlink").field("path", path).field("target", target).field("attr", attr).finish(),
-            Self::Write { ino, path, data: _ } => f.debug_struct("Write").field("ino", ino).field("path", path).finish(),
-            Self::SetAttr { path, attr } => f.debug_struct("SetAttr").field("path", path).field("attr", attr).finish(),
-            Self::Delete { path } => f.debug_struct("Delete").field("path", path).finish(),
-            Self::Rename { old_path, new_path } => f.debug_struct("Rename").field("old_path", old_path).field("new_path", new_path).finish(),
-            Self::Link { source_path, link_path } => f.debug_struct("Link").field("source_path", source_path).field("link_path", link_path).finish(),
+            Self::CreateFile { parent, name, attr } => f.debug_struct("CreateFile").field("parent", parent).field("name", name).field("attr", attr).finish(),
+            Self::CreateDir { parent, name, attr } => f.debug_struct("CreateDir").field("parent", parent).field("name", name).field("attr", attr).finish(),
+            Self::CreateSymlink { parent, name, target, attr } => f.debug_struct("CreateSymlink").field("parent", parent).field("name", name).field("target", target).field("attr", attr).finish(),
+            Self::Write { ino } => f.debug_struct("Write").field("ino", ino).finish(),
+            Self::SetAttr { ino, attr } => f.debug_struct("SetAttr").field("ino", ino).field("attr", attr).finish(),
+            Self::Delete { parent, name } => f.debug_struct("Delete").field("parent", parent).field("name", name).finish(),
+            Self::Rename { parent, name, new_parent, new_name } => f.debug_struct("Rename").field("parent", parent).field("name", name).field("new_parent", new_parent).field("new_name", new_name).finish(),
+            Self::Link { ino, new_parent, new_name } => f.debug_struct("Link").field("ino", ino).field("new_parent", new_parent).field("new_name", new_name).finish(),
         }
     }
 }
@@ -128,7 +153,12 @@ impl DiskImageWorker {
     ) -> std::io::Result<()> {
         debug!("Executing job: {job:?}");
         match job {
-            WriteJob::CreateFile { path, attr } => {
+            WriteJob::CreateFile { parent, name, attr } => {
+                let path = {
+                    let nodes = nodes.read().unwrap();
+                    let parent_path = build_path(&nodes, parent).map_err(|e| std::io::Error::from_raw_os_error(e))?;
+                    parent_path.join(name)
+                };
                 let fs_path = disk_image.get_fs_path(&path);
                 if let Some(parent) = fs_path.parent() {
                     fs::create_dir_all(parent)?;
@@ -138,14 +168,24 @@ impl DiskImageWorker {
                 fs::set_permissions(&fs_path, perm)?;
                 chown(&fs_path, Some(attr.uid), Some(attr.gid))?;
             }
-            WriteJob::CreateDir { path, attr } => {
+            WriteJob::CreateDir { parent, name, attr } => {
+                let path = {
+                    let nodes = nodes.read().unwrap();
+                    let parent_path = build_path(&nodes, parent).map_err(|e| std::io::Error::from_raw_os_error(e))?;
+                    parent_path.join(name)
+                };
                 let fs_path = disk_image.get_fs_path(&path);
                 fs::create_dir_all(&fs_path)?;
                 let perm = fs::Permissions::from_mode(attr.perm as u32);
                 fs::set_permissions(&fs_path, perm)?;
                 chown(&fs_path, Some(attr.uid), Some(attr.gid))?;
             }
-            WriteJob::CreateSymlink { path, target, attr } => {
+            WriteJob::CreateSymlink { parent, name, target, attr } => {
+                let path = {
+                    let nodes = nodes.read().unwrap();
+                    let parent_path = build_path(&nodes, parent).map_err(|e| std::io::Error::from_raw_os_error(e))?;
+                    parent_path.join(name)
+                };
                 let fs_path = disk_image.get_fs_path(&path);
                 if let Some(parent) = fs_path.parent() {
                     fs::create_dir_all(parent)?;
@@ -153,22 +193,47 @@ impl DiskImageWorker {
                 symlink(&target, &fs_path)?;
                 chown(&fs_path, Some(attr.uid), Some(attr.gid))?;
             }
-            WriteJob::Write { ino, path, data } => {
-                let fs_path = disk_image.get_fs_path(&path);
-                fs::write(&fs_path, &data)?;
+            WriteJob::Write { ino } => {
+                let (path, data_to_write) = {
+                    let nodes = nodes.read().unwrap();
+                    let path = match build_path(&nodes, ino) {
+                        Ok(p) => p,
+                        Err(_) => return Ok(()), // Node not found, nothing to do
+                    };
 
-                let mut nodes = nodes.write().unwrap();
-                if let Ok(node) = nodes.get_mut(ino) {
-                    if let NodeKind::File { content } = &mut node.kind {
-                        if let FileContent::Dirty(mem_data) = content {
-                            if mem_data.as_slice() == data.as_slice() {
-                                *content = FileContent::OnDisk;
+                    if let Ok(node) = nodes.get(ino) {
+                        if let NodeKind::File { content: FileContent::Dirty(data) } = &node.kind {
+                            (path, Some(data.clone()))
+                        } else {
+                            (path, None)
+                        }
+                    } else {
+                        return Ok(()); // Node not found, nothing to do
+                    }
+                };
+
+                if let Some(data) = data_to_write {
+                    let fs_path = disk_image.get_fs_path(&path);
+                    fs::write(&fs_path, &data)?;
+
+                    // Now re-acquire lock to update state
+                    let mut nodes = nodes.write().unwrap();
+                    if let Ok(node) = nodes.get_mut(ino) {
+                        if let NodeKind::File { content } = &mut node.kind {
+                            if let FileContent::Dirty(current_data) = &*content {
+                                if current_data.as_slice() == data.as_slice() {
+                                    *content = FileContent::OnDisk;
+                                }
                             }
                         }
                     }
                 }
             }
-            WriteJob::SetAttr { path, attr } => {
+            WriteJob::SetAttr { ino, attr } => {
+                let path = {
+                    let nodes = nodes.read().unwrap();
+                    build_path(&nodes, ino).map_err(|e| std::io::Error::from_raw_os_error(e))?
+                };
                 let fs_path = disk_image.get_fs_path(&path);
                 let perm = fs::Permissions::from_mode(attr.perm as u32);
                 fs::set_permissions(&fs_path, perm)?;
@@ -177,7 +242,12 @@ impl DiskImageWorker {
                     file.set_len(attr.size)?;
                 }
             }
-            WriteJob::Delete { path } => {
+            WriteJob::Delete { parent, name } => {
+                let path = {
+                    let nodes = nodes.read().unwrap();
+                    let parent_path = build_path(&nodes, parent).map_err(|e| std::io::Error::from_raw_os_error(e))?;
+                    parent_path.join(name)
+                };
                 let fs_path = disk_image.get_fs_path(&path);
                 if fs_path.is_dir() {
                     fs::remove_dir(fs_path)?;
@@ -185,15 +255,27 @@ impl DiskImageWorker {
                     fs::remove_file(fs_path)?;
                 }
             }
-            WriteJob::Rename { old_path, new_path } => {
+            WriteJob::Rename { parent, name, new_parent, new_name } => {
+                let (old_path, new_path) = {
+                    let nodes = nodes.read().unwrap();
+                    let old_parent_path = build_path(&nodes, parent).map_err(|e| std::io::Error::from_raw_os_error(e))?;
+                    let old_path = old_parent_path.join(name);
+                    let new_parent_path = build_path(&nodes, new_parent).map_err(|e| std::io::Error::from_raw_os_error(e))?;
+                    let new_path = new_parent_path.join(new_name);
+                    (old_path, new_path)
+                };
                 let old_fs_path = disk_image.get_fs_path(&old_path);
                 let new_fs_path = disk_image.get_fs_path(&new_path);
                 fs::rename(old_fs_path, new_fs_path)?;
             }
-            WriteJob::Link {
-                source_path,
-                link_path,
-            } => {
+            WriteJob::Link { ino, new_parent, new_name } => {
+                let (source_path, link_path) = {
+                    let nodes = nodes.read().unwrap();
+                    let source_path = build_path(&nodes, ino).map_err(|e| std::io::Error::from_raw_os_error(e))?;
+                    let new_parent_path = build_path(&nodes, new_parent).map_err(|e| std::io::Error::from_raw_os_error(e))?;
+                    let link_path = new_parent_path.join(new_name);
+                    (source_path, link_path)
+                };
                 let source_fs_path = disk_image.get_fs_path(&source_path);
                 let link_fs_path = disk_image.get_fs_path(&link_path);
                 if let Some(parent) = link_fs_path.parent() {
