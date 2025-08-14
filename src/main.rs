@@ -7,6 +7,7 @@ use std::result::Result;
 mod disk_image;
 mod mem_fuse;
 mod node;
+mod dirty;
 
 #[derive(Debug, Parser)]
 #[command(name = "inv-fuse")]

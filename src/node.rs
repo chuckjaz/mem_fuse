@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
+    sync::{Arc, RwLock},
     time::SystemTime,
 };
 
@@ -9,7 +10,7 @@ use fuser::FileAttr;
 use indexmap::IndexMap;
 use libc::{EEXIST, ENOENT, ENOTDIR};
 
-use crate::mem_fuse::{OrError, Result};
+use crate::{dirty::DirtyRegions, mem_fuse::{OrError, Result}};
 
 pub struct Directory {
     entries: IndexMap<OsString, u64>,
@@ -53,14 +54,28 @@ impl Directory {
 }
 
 pub enum FileContent {
-    InMemory(Vec<u8>),
+    InMemory(Arc<RwLock<Vec<u8>>>),
     OnDisk,
 }
 
+pub struct File {
+    pub content: FileContent,
+    pub dirty: bool,
+    pub dirty_regions: DirtyRegions,
+}
+
+impl File {
+    pub fn new() -> Self {
+        Self {
+            content: FileContent::InMemory(Arc::new(RwLock::new(Vec::new()))),
+            dirty: false,
+            dirty_regions: DirtyRegions::new(),
+        }
+    }
+}
+
 pub enum NodeKind {
-    File {
-        content: FileContent,
-    },
+    File(File),
     Directory {
         dir: Directory,
     },
@@ -78,9 +93,7 @@ impl Node {
     pub fn new_file(attr: FileAttr) -> Self {
         Self {
             attr,
-            kind: NodeKind::File {
-                content: FileContent::InMemory(Vec::new()),
-            },
+            kind: NodeKind::File(File::new()),
         }
     }
 

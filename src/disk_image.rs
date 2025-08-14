@@ -2,7 +2,7 @@ use std::{
     ffi::OsString,
     fmt::Debug,
     fs,
-    os::unix::fs::{chown, symlink, PermissionsExt},
+    os::unix::fs::{chown, symlink, PermissionsExt, FileExt},
     path::{Path, PathBuf},
     sync::{
         mpsc::{self, Sender},
@@ -179,36 +179,57 @@ impl DiskImageWorker {
                 chown(&fs_path, Some(attr.uid), Some(attr.gid))?;
             }
             WriteJob::Write { ino } => {
-                let (path, data_to_write) = {
-                    let nodes = nodes.read().unwrap();
-                    let path = match build_path(&nodes, ino) {
-                        Ok(p) => p,
-                        Err(_) => return Ok(()), // Node not found, nothing to do
+                let (path, data_to_write, regions) = {
+                    let path = {
+                        let nodes = nodes.read().unwrap();
+                        match build_path(&nodes, ino) {
+                            Ok(p) => p,
+                            Err(_) => return Ok(()), // Node not found, nothing to do
+                        }
                     };
 
-                    if let Ok(node) = nodes.get(ino) {
-                        if let NodeKind::File { content: FileContent::InMemory(data) } = &node.kind {
-                            (path, Some(data.clone()))
+                    let mut nodes = nodes.write().unwrap();
+                    let node = match nodes.get_mut(ino) {
+                        Ok(n) => n,
+                        Err(_) => return Ok(()),
+                    };
+
+                    if let NodeKind::File(file) = &mut node.kind {
+                        if !file.dirty {
+                            return Ok(());
+                        }
+                        file.dirty = false;
+                        let regions = file.dirty_regions.regions().clone();
+                        file.dirty_regions.clear();
+                        if let FileContent::InMemory(data) = &file.content {
+                            (path, Some(data.clone()), regions)
                         } else {
-                            (path, None)
+                            (path, None, regions)
                         }
                     } else {
-                        return Ok(()); // Node not found, nothing to do
+                        return Ok(());
                     }
                 };
 
                 if let Some(data) = data_to_write {
                     let fs_path = disk_image.get_fs_path(&path);
-                    fs::write(&fs_path, &data)?;
+                    let file = fs::OpenOptions::new().write(true).open(&fs_path)?;
+                    let data = data.read().unwrap();
+                    for (start, end) in regions {
+                        let start = start as usize;
+                        let end = end as usize;
+                        if end > data.len() {
+                            continue;
+                        }
+                        file.write_all_at(&data[start..end], start as u64)?;
+                    }
 
                     // Now re-acquire lock to update state
                     let mut nodes = nodes.write().unwrap();
                     if let Ok(node) = nodes.get_mut(ino) {
-                        if let NodeKind::File { content } = &mut node.kind {
-                            if let FileContent::InMemory(current_data) = &*content {
-                                if current_data.as_slice() == data.as_slice() {
-                                    *content = FileContent::OnDisk;
-                                }
+                        if let NodeKind::File(file) = &mut node.kind {
+                            if !file.dirty {
+                                file.content = FileContent::OnDisk;
                             }
                         }
                     }

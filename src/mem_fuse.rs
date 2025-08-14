@@ -102,8 +102,8 @@ impl MemoryFuse {
             attr.flags = flags;
         }
         if let Some(size) = size {
-            if let NodeKind::File { content } = &mut node.kind {
-                let data = match content {
+            if let NodeKind::File(file) = &mut node.kind {
+                let data = match &mut file.content {
                     FileContent::InMemory(data) => data,
                     FileContent::OnDisk => {
                         let fs_path = self
@@ -113,16 +113,34 @@ impl MemoryFuse {
                             .image()
                             .get_fs_path(&path.unwrap());
                         let new_data = fs::read(fs_path).unwrap_or_default();
-                        *content = FileContent::InMemory(new_data);
-                        if let FileContent::InMemory(data) = content {
+                        file.content = FileContent::InMemory(Arc::new(RwLock::new(new_data)));
+                        if let FileContent::InMemory(data) = &mut file.content {
                             data
                         } else {
                             unreachable!()
                         }
                     }
                 };
+                let old_size = {
+                    let data = data.read().unwrap();
+                    data.len() as u64
+                };
+                if size < old_size {
+                    file.dirty_regions.truncate(size);
+                } else {
+                    file.dirty_regions.add_region(old_size, size);
+                }
+
+                let mut data = data.write().unwrap();
                 data.resize(size as usize, 0u8);
                 attr.size = size;
+                file.dirty = true;
+                if let Some(worker) = &self.disk_worker {
+                    worker
+                        .sender()
+                        .send(WriteJob::Write { ino })
+                        .unwrap();
+                }
             }
         }
         node.attr = attr;
@@ -378,9 +396,9 @@ impl MemoryFuse {
         };
         let mut nodes = self.nodes.write().unwrap();
         let node = nodes.get_mut(ino)?;
-        if let NodeKind::File { content } = &mut node.kind {
-            let data = match content {
-                FileContent::InMemory(data) => data,
+        if let NodeKind::File(file) = &mut node.kind {
+            let data = match &mut file.content {
+                FileContent::InMemory(data) => data.clone(),
                 FileContent::OnDisk => {
                     let fs_path = self
                         .disk_worker
@@ -389,14 +407,12 @@ impl MemoryFuse {
                         .image()
                         .get_fs_path(&path.unwrap());
                     let new_data = fs::read(fs_path).unwrap_or_default();
-                    *content = FileContent::InMemory(new_data);
-                    if let FileContent::InMemory(data) = content {
-                        data
-                    } else {
-                        unreachable!()
-                    }
+                    let new_data_arc = Arc::new(RwLock::new(new_data));
+                    file.content = FileContent::InMemory(new_data_arc.clone());
+                    new_data_arc
                 }
             };
+            let data = data.read().unwrap();
             let effective_offset = if offset < 0 {
                 max(0, (data.len() as i64 + offset) as usize)
             } else {
@@ -417,9 +433,9 @@ impl MemoryFuse {
         let mut nodes = self.nodes.write().unwrap();
         let node = nodes.get_mut(ino)?;
         let new_size = {
-            if let NodeKind::File { content } = &mut node.kind {
-                let data = match content {
-                    FileContent::InMemory(data) => data,
+            if let NodeKind::File(file) = &mut node.kind {
+                let data_arc = match &mut file.content {
+                    FileContent::InMemory(data) => data.clone(),
                     FileContent::OnDisk => {
                         let fs_path = self
                             .disk_worker
@@ -428,14 +444,12 @@ impl MemoryFuse {
                             .image()
                             .get_fs_path(&path.unwrap());
                         let new_data = fs::read(fs_path).unwrap_or_default();
-                        *content = FileContent::InMemory(new_data);
-                        if let FileContent::InMemory(data) = content {
-                            data
-                        } else {
-                            unreachable!()
-                        }
+                        let new_data_arc = Arc::new(RwLock::new(new_data));
+                        file.content = FileContent::InMemory(new_data_arc.clone());
+                        new_data_arc
                     }
                 };
+                let mut data = data_arc.write().unwrap();
                 let effective_offset = if offset < 0 {
                     (data.len() as i64 + offset) as usize
                 } else {
@@ -451,11 +465,11 @@ impl MemoryFuse {
                     data.resize(new_size, 0u8);
                 }
                 data[effective_offset..effective_size].copy_from_slice(new_data);
+                file.dirty = true;
+                file.dirty_regions
+                    .add_region(effective_offset as u64, effective_size as u64);
                 if let Some(worker) = &self.disk_worker {
-                    worker
-                        .sender()
-                        .send(WriteJob::Write { ino })
-                        .unwrap();
+                    worker.sender().send(WriteJob::Write { ino }).unwrap();
                 }
                 new_size
             } else {
@@ -951,8 +965,8 @@ mod tests {
             if on_disk_data == data {
                 let nodes = fuse.nodes.read().unwrap();
                 let node = nodes.get(file_ino).unwrap();
-                if let NodeKind::File { content } = &node.kind {
-                    if let FileContent::OnDisk = content {
+                if let NodeKind::File(file) = &node.kind {
+                    if let FileContent::OnDisk = &file.content {
                         is_on_disk = true;
                         break;
                     }
