@@ -500,7 +500,7 @@ impl Filesystem for MemoryFuse {
 
     fn destroy(&mut self) {
         info!("destroying");
-        if let Some(mut worker) = self.disk_worker.take() {
+        if let Some(worker) = self.disk_worker.take() {
             worker.stop();
         }
     }
