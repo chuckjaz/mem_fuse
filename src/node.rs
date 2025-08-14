@@ -55,7 +55,6 @@ impl Directory {
 pub enum FileContent {
     InMemory(Vec<u8>),
     OnDisk,
-    Dirty(Vec<u8>),
 }
 
 pub enum NodeKind {

@@ -104,7 +104,7 @@ impl MemoryFuse {
         if let Some(size) = size {
             if let NodeKind::File { content } = &mut node.kind {
                 let data = match content {
-                    FileContent::Dirty(data) | FileContent::InMemory(data) => data,
+                    FileContent::InMemory(data) => data,
                     FileContent::OnDisk => {
                         let fs_path = self
                             .disk_worker
@@ -380,7 +380,7 @@ impl MemoryFuse {
         let node = nodes.get_mut(ino)?;
         if let NodeKind::File { content } = &mut node.kind {
             let data = match content {
-                FileContent::Dirty(data) | FileContent::InMemory(data) => data,
+                FileContent::InMemory(data) => data,
                 FileContent::OnDisk => {
                     let fs_path = self
                         .disk_worker
@@ -419,7 +419,7 @@ impl MemoryFuse {
         let new_size = {
             if let NodeKind::File { content } = &mut node.kind {
                 let data = match content {
-                    FileContent::Dirty(data) | FileContent::InMemory(data) => data,
+                    FileContent::InMemory(data) => data,
                     FileContent::OnDisk => {
                         let fs_path = self
                             .disk_worker
@@ -452,12 +452,10 @@ impl MemoryFuse {
                 }
                 data[effective_offset..effective_size].copy_from_slice(new_data);
                 if let Some(worker) = &self.disk_worker {
-                    let new_content = FileContent::Dirty(data.clone());
                     worker
                         .sender()
                         .send(WriteJob::Write { ino })
                         .unwrap();
-                    *content = new_content;
                 }
                 new_size
             } else {
