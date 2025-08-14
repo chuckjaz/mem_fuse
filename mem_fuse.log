@@ -1,0 +1,7 @@
+error: unexpected argument '--mount-point' found
+
+  tip: to pass '--mount-point' as a value, use '-- --mount-point'
+
+Usage: mem_fuse [OPTIONS] <PATH>
+
+For more information, try '--help'.
