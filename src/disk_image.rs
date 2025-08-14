@@ -59,6 +59,7 @@ impl DiskImage {
     }
 }
 
+#[derive(Debug)]
 pub enum WriteJob {
     CreateFile {
         parent: u64,
@@ -98,22 +99,6 @@ pub enum WriteJob {
         new_parent: u64,
         new_name: OsString,
     },
-}
-
-impl Debug for WriteJob {
-    // Implemented explicitly to avoid writing large Vec<u8> to logs.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::CreateFile { parent, name, attr } => f.debug_struct("CreateFile").field("parent", parent).field("name", name).field("attr", attr).finish(),
-            Self::CreateDir { parent, name, attr } => f.debug_struct("CreateDir").field("parent", parent).field("name", name).field("attr", attr).finish(),
-            Self::CreateSymlink { parent, name, target, attr } => f.debug_struct("CreateSymlink").field("parent", parent).field("name", name).field("target", target).field("attr", attr).finish(),
-            Self::Write { ino } => f.debug_struct("Write").field("ino", ino).finish(),
-            Self::SetAttr { ino, attr } => f.debug_struct("SetAttr").field("ino", ino).field("attr", attr).finish(),
-            Self::Delete { parent, name } => f.debug_struct("Delete").field("parent", parent).field("name", name).finish(),
-            Self::Rename { parent, name, new_parent, new_name } => f.debug_struct("Rename").field("parent", parent).field("name", name).field("new_parent", new_parent).field("new_name", new_name).finish(),
-            Self::Link { ino, new_parent, new_name } => f.debug_struct("Link").field("ino", ino).field("new_parent", new_parent).field("new_name", new_name).finish(),
-        }
-    }
 }
 
 pub struct DiskImageWorker {
