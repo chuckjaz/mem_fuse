@@ -26,7 +26,6 @@ pub struct MemoryFuse {
 impl MemoryFuse {
     pub fn new(disk_image_path: Option<PathBuf>, cache_size: u64, lazy_load: bool) -> MemoryFuse {
         let mut nodes = Nodes::new();
-        let mut next_ino = 2;
 
         let next_ino_atomic = AtomicUsize::new(2);
         if lazy_load {
