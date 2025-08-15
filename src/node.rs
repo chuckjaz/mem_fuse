@@ -78,16 +78,31 @@ impl File {
             dirty_regions: DirtyRegions::new(),
         }
     }
+
+    pub fn new_on_disk() -> Self {
+        Self {
+            content: FileContent::OnDisk,
+            dirty: false,
+            dirty_regions: DirtyRegions::new(),
+        }
+    }
+}
+
+pub enum DirectoryKind {
+    InMemory(Directory),
+    OnDisk,
+}
+
+impl DirectoryKind {
+    pub fn is_ondisk(&self) -> bool {
+        matches!(self, DirectoryKind::OnDisk)
+    }
 }
 
 pub enum NodeKind {
     File(File),
-    Directory {
-        dir: Directory,
-    },
-    SymbolicLink {
-        target: PathBuf,
-    },
+    Directory(DirectoryKind),
+    SymbolicLink { target: PathBuf },
 }
 
 pub struct Node {
@@ -103,12 +118,24 @@ impl Node {
         }
     }
 
+    pub fn new_file_on_disk(attr: FileAttr) -> Self {
+        Self {
+            attr,
+            kind: NodeKind::File(File::new_on_disk()),
+        }
+    }
+
     pub fn new_directory(attr: FileAttr) -> Self {
         Self {
             attr,
-            kind: NodeKind::Directory {
-                dir: Directory::new(),
-            },
+            kind: NodeKind::Directory(DirectoryKind::InMemory(Directory::new())),
+        }
+    }
+
+    pub fn new_directory_on_disk(attr: FileAttr) -> Self {
+        Self {
+            attr,
+            kind: NodeKind::Directory(DirectoryKind::OnDisk),
         }
     }
 
@@ -132,7 +159,8 @@ impl Node {
     pub fn get_dir(&mut self) -> Result<&Directory> {
         self.accessed();
         match &self.kind {
-            NodeKind::Directory { dir } => Ok(dir),
+            NodeKind::Directory(DirectoryKind::InMemory(dir)) => Ok(dir),
+            NodeKind::Directory(DirectoryKind::OnDisk) => Err(EEXIST),
             _ => Err(ENOTDIR),
         }
     }
@@ -140,7 +168,8 @@ impl Node {
     pub fn get_dir_mut(&mut self) -> Result<&mut Directory> {
         self.written();
         match &mut self.kind {
-            NodeKind::Directory { dir } => Ok(dir),
+            NodeKind::Directory(DirectoryKind::InMemory(dir)) => Ok(dir),
+            NodeKind::Directory(DirectoryKind::OnDisk) => Err(EEXIST),
             _ => Err(ENOTDIR),
         }
     }
@@ -233,7 +262,7 @@ impl Nodes {
 
     pub fn get_dir_anon(&self, ino: u64) -> Result<&Directory> {
         let node = self.get(ino)?;
-        if let NodeKind::Directory { dir } = &node.kind {
+        if let NodeKind::Directory(DirectoryKind::InMemory(dir)) = &node.kind {
             Ok(dir)
         } else {
             Err(ENOTDIR)
