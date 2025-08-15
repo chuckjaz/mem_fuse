@@ -12,6 +12,7 @@ use libc::{EEXIST, ENOENT, ENOTDIR};
 
 use crate::{dirty::DirtyRegions, mem_fuse::{OrError, Result}};
 
+#[derive(Clone)]
 pub struct Directory {
     entries: IndexMap<OsString, u64>,
 }
@@ -53,6 +54,7 @@ impl Directory {
     }
 }
 
+#[derive(Clone)]
 pub enum FileContent {
     InMemory(Arc<RwLock<Vec<u8>>>),
     OnDisk,
@@ -64,6 +66,7 @@ impl FileContent {
     }
 }
 
+#[derive(Clone)]
 pub struct File {
     pub content: FileContent,
     pub dirty: bool,
@@ -88,6 +91,7 @@ impl File {
     }
 }
 
+#[derive(Clone)]
 pub enum DirectoryKind {
     InMemory(Directory),
     OnDisk,
@@ -99,12 +103,14 @@ impl DirectoryKind {
     }
 }
 
+#[derive(Clone)]
 pub enum NodeKind {
     File(File),
     Directory(DirectoryKind),
     SymbolicLink { target: PathBuf },
 }
 
+#[derive(Clone)]
 pub struct Node {
     pub kind: NodeKind,
     pub attr: FileAttr,
@@ -194,6 +200,7 @@ impl Node {
     }
 }
 
+#[derive(Clone)]
 pub struct Nodes {
     nodes: HashMap<u64, Node>,
     parents: HashMap<u64, Vec<(u64, OsString)>>,
