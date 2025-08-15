@@ -14,7 +14,6 @@ use std::{
 use fuser::FileAttr;
 use libc::{c_int, ENOENT};
 use log::{debug, info};
-
 use crate::node::{FileContent, NodeKind, Nodes};
 
 pub(crate) type Result<T> = std::result::Result<T, c_int>;
@@ -33,30 +32,6 @@ pub fn build_path(nodes: &Nodes, ino: u64) -> Result<PathBuf> {
     }
 
     Err(ENOENT)
-}
-
-#[derive(Debug, Clone)]
-pub struct DiskImage {
-    base_path: PathBuf,
-}
-
-impl DiskImage {
-    pub fn new(base_path: PathBuf) -> Self {
-        if !base_path.exists() {
-            info!("Creating disk image path at {:?}", base_path);
-            fs::create_dir_all(&base_path).unwrap();
-        }
-        Self { base_path }
-    }
-
-    pub fn get_fs_path(&self, path: &Path) -> PathBuf {
-        let relative_path = if path.has_root() {
-            path.strip_prefix("/").unwrap()
-        } else {
-            path
-        };
-        self.base_path.join(relative_path)
-    }
 }
 
 #[derive(Debug)]
@@ -101,38 +76,35 @@ pub enum WriteJob {
     },
 }
 
-pub struct DiskImageWorker {
-    disk_image: DiskImage,
+pub struct MirrorWorker {
     work_queue: Sender<WriteJob>,
     worker_thread: Option<JoinHandle<()>>,
 }
 
-impl DiskImageWorker {
+impl MirrorWorker {
     pub fn new(
-        base_path: PathBuf,
+        mirror: Arc<dyn Mirror + Send + Sync>,
         nodes: Arc<RwLock<Nodes>>,
     ) -> Self {
-        let disk_image = DiskImage::new(base_path);
         let (tx, rx) = mpsc::channel::<WriteJob>();
 
-        let worker_disk_image = disk_image.clone();
+        let worker_mirror = mirror;
         let worker_thread = thread::spawn(move || {
             for job in rx {
-                if let Err(e) = Self::handle_job(&worker_disk_image, &nodes, job) {
+                if let Err(e) = Self::handle_job(&worker_mirror, &nodes, job) {
                     debug!("Failed to execute write job: {e:?}");
                 }
             }
         });
 
         Self {
-            disk_image,
             work_queue: tx,
             worker_thread: Some(worker_thread),
         }
     }
 
     fn handle_job(
-        disk_image: &DiskImage,
+        mirror: &Arc<dyn Mirror + Send + Sync>,
         nodes: &Arc<RwLock<Nodes>>,
         job: WriteJob,
     ) -> std::io::Result<()> {
@@ -144,14 +116,7 @@ impl DiskImageWorker {
                     let parent_path = build_path(&nodes, parent).map_err(|e| std::io::Error::from_raw_os_error(e))?;
                     parent_path.join(name)
                 };
-                let fs_path = disk_image.get_fs_path(&path);
-                if let Some(parent) = fs_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::File::create(&fs_path)?;
-                let perm = fs::Permissions::from_mode(attr.perm as u32);
-                fs::set_permissions(&fs_path, perm)?;
-                chown(&fs_path, Some(attr.uid), Some(attr.gid))?;
+                mirror.create_file(&path, &attr)?;
             }
             WriteJob::CreateDir { parent, name, attr } => {
                 let path = {
@@ -159,11 +124,7 @@ impl DiskImageWorker {
                     let parent_path = build_path(&nodes, parent).map_err(|e| std::io::Error::from_raw_os_error(e))?;
                     parent_path.join(name)
                 };
-                let fs_path = disk_image.get_fs_path(&path);
-                fs::create_dir_all(&fs_path)?;
-                let perm = fs::Permissions::from_mode(attr.perm as u32);
-                fs::set_permissions(&fs_path, perm)?;
-                chown(&fs_path, Some(attr.uid), Some(attr.gid))?;
+                mirror.create_dir(&path, &attr)?;
             }
             WriteJob::CreateSymlink { parent, name, target, attr } => {
                 let path = {
@@ -171,12 +132,7 @@ impl DiskImageWorker {
                     let parent_path = build_path(&nodes, parent).map_err(|e| std::io::Error::from_raw_os_error(e))?;
                     parent_path.join(name)
                 };
-                let fs_path = disk_image.get_fs_path(&path);
-                if let Some(parent) = fs_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                symlink(&target, &fs_path)?;
-                chown(&fs_path, Some(attr.uid), Some(attr.gid))?;
+                mirror.create_symlink(&target, &path, &attr)?;
             }
             WriteJob::Write { ino } => {
                 let (path, data_to_write, regions) = {
@@ -212,20 +168,15 @@ impl DiskImageWorker {
                 };
 
                 if let Some(data) = data_to_write {
-                    {
-                        let fs_path = disk_image.get_fs_path(&path);
-                        let file = fs::OpenOptions::new().write(true).open(&fs_path)?;
-                        let data = data.read().unwrap();
-                        for (start, end) in regions {
-                            let start = start as usize;
-                            let end = end as usize;
-                            if end > data.len() {
-                                continue;
-                            }
-                            file.write_all_at(&data[start..end], start as u64)?;
+                    let data = data.read().unwrap();
+                    for (start, end) in regions {
+                        let start = start as usize;
+                        let end = end as usize;
+                        if end > data.len() {
+                            continue;
                         }
+                        mirror.write(&path, &data[start..end], start as u64)?;
                     }
-
                 }
             }
             WriteJob::SetAttr { ino, attr } => {
@@ -233,13 +184,7 @@ impl DiskImageWorker {
                     let nodes = nodes.read().unwrap();
                     build_path(&nodes, ino).map_err(|e| std::io::Error::from_raw_os_error(e))?
                 };
-                let fs_path = disk_image.get_fs_path(&path);
-                let perm = fs::Permissions::from_mode(attr.perm as u32);
-                fs::set_permissions(&fs_path, perm)?;
-                chown(&fs_path, Some(attr.uid), Some(attr.gid))?;
-                if let Ok(file) = fs::OpenOptions::new().write(true).open(&fs_path) {
-                    file.set_len(attr.size)?;
-                }
+                mirror.set_attr(&path, &attr, Some(attr.size))?;
             }
             WriteJob::Delete { parent, name } => {
                 let path = {
@@ -247,12 +192,7 @@ impl DiskImageWorker {
                     let parent_path = build_path(&nodes, parent).map_err(|e| std::io::Error::from_raw_os_error(e))?;
                     parent_path.join(name)
                 };
-                let fs_path = disk_image.get_fs_path(&path);
-                if fs_path.is_dir() {
-                    fs::remove_dir(fs_path)?;
-                } else {
-                    fs::remove_file(fs_path)?;
-                }
+                mirror.delete(&path)?;
             }
             WriteJob::Rename { parent, name, new_parent, new_name } => {
                 let (old_path, new_path) = {
@@ -263,9 +203,7 @@ impl DiskImageWorker {
                     let new_path = new_parent_path.join(new_name);
                     (old_path, new_path)
                 };
-                let old_fs_path = disk_image.get_fs_path(&old_path);
-                let new_fs_path = disk_image.get_fs_path(&new_path);
-                fs::rename(old_fs_path, new_fs_path)?;
+                mirror.rename(&old_path, &new_path)?;
             }
             WriteJob::Link { ino, new_parent, new_name } => {
                 let (source_path, link_path) = {
@@ -275,12 +213,7 @@ impl DiskImageWorker {
                     let link_path = new_parent_path.join(new_name);
                     (source_path, link_path)
                 };
-                let source_fs_path = disk_image.get_fs_path(&source_path);
-                let link_fs_path = disk_image.get_fs_path(&link_path);
-                if let Some(parent) = link_fs_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::hard_link(source_fs_path, link_fs_path)?;
+                mirror.link(&source_path, &link_path)?;
             }
         }
         Ok(())
@@ -299,8 +232,134 @@ impl DiskImageWorker {
             worker_thread.join().unwrap();
         }
     }
+}
 
-    pub fn image(&self) -> &DiskImage {
-        &self.disk_image
+pub trait Mirror: Debug {
+    fn read_dir(&self, path: &Path) -> std::io::Result<Vec<fs::DirEntry>>;
+    fn read_link(&self, path: &Path) -> std::io::Result<PathBuf>;
+    fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>>;
+    fn create_file(&self, path: &Path, attr: &FileAttr) -> std::io::Result<()>;
+    fn create_dir(&self, path: &Path, attr: &FileAttr) -> std::io::Result<()>;
+    fn create_symlink(&self, target: &Path, link_path: &Path, attr: &FileAttr) -> std::io::Result<()>;
+    fn write(&self, path: &Path, data: &[u8], offset: u64) -> std::io::Result<()>;
+    fn set_attr(&self, path: &Path, attr: &FileAttr, size: Option<u64>) -> std::io::Result<()>;
+    fn delete(&self, path: &Path) -> std::io::Result<()>;
+    fn rename(&self, old_path: &Path, new_path: &Path) -> std::io::Result<()>;
+    fn link(&self, source_path: &Path, link_path: &Path) -> std::io::Result<()>;
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalMirror {
+    base_path: PathBuf,
+}
+
+impl LocalMirror {
+    pub fn new(base_path: PathBuf) -> Self {
+        if !base_path.exists() {
+            info!("Creating disk image path at {:?}", base_path);
+            fs::create_dir_all(&base_path).unwrap();
+        }
+        Self { base_path }
+    }
+
+    pub fn get_fs_path(&self, path: &Path) -> PathBuf {
+        let relative_path = if path.has_root() {
+            path.strip_prefix("/").unwrap()
+        } else {
+            path
+        };
+        self.base_path.join(relative_path)
+    }
+}
+
+impl Mirror for LocalMirror {
+    fn read_dir(&self, path: &Path) -> std::io::Result<Vec<fs::DirEntry>> {
+        let fs_path = self.get_fs_path(path);
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(fs_path)? {
+            entries.push(entry?);
+        }
+        Ok(entries)
+    }
+
+    fn read_link(&self, path: &Path) -> std::io::Result<PathBuf> {
+        let fs_path = self.get_fs_path(path);
+        fs::read_link(fs_path)
+    }
+
+    fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        let fs_path = self.get_fs_path(path);
+        fs::read(fs_path)
+    }
+
+    fn create_file(&self, path: &Path, attr: &FileAttr) -> std::io::Result<()> {
+        let fs_path = self.get_fs_path(path);
+        if let Some(parent) = fs_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::File::create(&fs_path)?;
+        let perm = fs::Permissions::from_mode(attr.perm as u32);
+        fs::set_permissions(&fs_path, perm)?;
+        chown(&fs_path, Some(attr.uid), Some(attr.gid))
+    }
+
+    fn create_dir(&self, path: &Path, attr: &FileAttr) -> std::io::Result<()> {
+        let fs_path = self.get_fs_path(path);
+        fs::create_dir_all(&fs_path)?;
+        let perm = fs::Permissions::from_mode(attr.perm as u32);
+        fs::set_permissions(&fs_path, perm)?;
+        chown(&fs_path, Some(attr.uid), Some(attr.gid))
+    }
+
+    fn create_symlink(&self, target: &Path, link_path: &Path, attr: &FileAttr) -> std::io::Result<()> {
+        let fs_path = self.get_fs_path(link_path);
+        if let Some(parent) = fs_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        symlink(&target, &fs_path)?;
+        chown(&fs_path, Some(attr.uid), Some(attr.gid))
+    }
+
+    fn write(&self, path: &Path, data: &[u8], offset: u64) -> std::io::Result<()> {
+        let fs_path = self.get_fs_path(path);
+        let file = fs::OpenOptions::new().write(true).open(&fs_path)?;
+        file.write_all_at(data, offset)
+    }
+
+    fn set_attr(&self, path: &Path, attr: &FileAttr, size: Option<u64>) -> std::io::Result<()> {
+        let fs_path = self.get_fs_path(path);
+        let perm = fs::Permissions::from_mode(attr.perm as u32);
+        fs::set_permissions(&fs_path, perm)?;
+        chown(&fs_path, Some(attr.uid), Some(attr.gid))?;
+        if let Some(size) = size {
+            if let Ok(file) = fs::OpenOptions::new().write(true).open(&fs_path) {
+                file.set_len(size)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn delete(&self, path: &Path) -> std::io::Result<()> {
+        let fs_path = self.get_fs_path(path);
+        if fs_path.is_dir() {
+            fs::remove_dir(fs_path)
+        } else {
+            fs::remove_file(fs_path)
+        }
+    }
+
+    fn rename(&self, old_path: &Path, new_path: &Path) -> std::io::Result<()> {
+        let old_fs_path = self.get_fs_path(old_path);
+        let new_fs_path = self.get_fs_path(new_path);
+        fs::rename(old_fs_path, new_fs_path)
+    }
+
+    fn link(&self, source_path: &Path, link_path: &Path) -> std::io::Result<()> {
+        let source_fs_path = self.get_fs_path(source_path);
+        let link_fs_path = self.get_fs_path(link_path);
+        if let Some(parent) = link_fs_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::hard_link(source_fs_path, link_fs_path)
     }
 }

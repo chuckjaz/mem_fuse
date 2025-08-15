@@ -1,5 +1,5 @@
 use std::{
-    ffi::{OsStr, OsString}, fs, os::unix::ffi::OsStrExt, path::{Path, PathBuf}, sync::{atomic::{AtomicUsize, Ordering}, Arc, RwLock, Condvar}, time::SystemTime, u32
+    ffi::{OsStr, OsString}, os::unix::ffi::OsStrExt, path::Path, sync::{atomic::{AtomicUsize, Ordering}, Arc, RwLock, Condvar}, time::SystemTime, u32
 };
 
 use fuser::{self, FileAttr, Filesystem, TimeOrNow};
@@ -9,8 +9,8 @@ use libc::{RENAME_NOREPLACE, RENAME_EXCHANGE};
 use log::{debug, info};
 use users::{get_current_gid, get_current_uid};
 
-use crate::disk_image::{build_path, DiskImage, DiskImageWorker, WriteJob};
 use crate::lru_cache::LruManager;
+use crate::mirror::{build_path, LocalMirror, Mirror, MirrorWorker, WriteJob};
 use crate::node::{DirectoryKind, FileContent, Node, NodeKind, Nodes};
 use std::os::unix::fs::MetadataExt;
 
@@ -19,19 +19,18 @@ pub(crate) type Result<T> = std::result::Result<T, c_int>;
 pub struct MemoryFuse {
     nodes: Arc<RwLock<Nodes>>,
     next_ino: AtomicUsize,
-    disk_worker: Option<DiskImageWorker>,
+    mirror_worker: Option<MirrorWorker>,
+    mirror: Option<Arc<dyn Mirror + Send + Sync>>,
     lru_manager: Arc<LruManager>,
 }
 
 impl MemoryFuse {
-    pub fn new(disk_image_path: Option<PathBuf>, cache_size: u64, lazy_load: bool) -> MemoryFuse {
+    pub fn new(mirror: Option<Arc<dyn Mirror + Send + Sync>>, cache_size: u64, lazy_load: bool) -> MemoryFuse {
         let mut nodes = Nodes::new();
 
         let next_ino_atomic = AtomicUsize::new(2);
         if lazy_load {
-            if let Some(path) = &disk_image_path {
-                let image = DiskImage::new(path.clone());
-                let fs_path = image.get_fs_path(Path::new(""));
+            if let Some(mirror) = &mirror {
                 let root_attr = new_attr(
                     1,
                     fuser::FileType::Directory,
@@ -44,8 +43,7 @@ impl MemoryFuse {
                 let _ = nodes.insert(root);
 
                 let mut new_entries = Vec::new();
-                for entry in fs::read_dir(fs_path).unwrap() {
-                    let entry = entry.unwrap();
+                for entry in mirror.read_dir(Path::new("")).unwrap() {
                     new_entries.push(entry);
                 }
 
@@ -79,7 +77,7 @@ impl MemoryFuse {
                     } else if kind == fuser::FileType::RegularFile {
                         Node::new_file_on_disk(attr)
                     } else {
-                        let target = fs::read_link(&path).unwrap();
+                        let target = mirror.read_link(&path).unwrap();
                         Node::new_symbolic_link(attr, &target)
                     };
                     let root_node = nodes.get_mut(1).unwrap();
@@ -108,13 +106,14 @@ impl MemoryFuse {
         let cache_cond = Arc::new(Condvar::new());
         let lru_manager = Arc::new(LruManager::new(cache_size, cache_cond.clone()));
 
-        let disk_worker =
-            disk_image_path.map(|path| DiskImageWorker::new(path, Arc::clone(&nodes)));
+        let mirror_worker =
+            mirror.clone().map(|mirror| MirrorWorker::new(mirror, Arc::clone(&nodes)));
 
         Self {
             nodes,
             next_ino: next_ino_atomic,
-            disk_worker,
+            mirror_worker,
+            mirror,
             lru_manager,
         }
     }
@@ -157,56 +156,56 @@ impl MemoryFuse {
             let nodes = self.nodes.read().unwrap();
             build_path(&nodes, ino)?
         };
-        let fs_path = self.disk_worker.as_ref().unwrap().image().get_fs_path(&path);
 
-        let mut new_dir = crate::node::Directory::new();
-        let mut new_nodes = Vec::new();
+        if let Some(mirror) = self.mirror.clone() {
+            let mut new_dir = crate::node::Directory::new();
+            let mut new_nodes = Vec::new();
 
-        for entry in fs::read_dir(fs_path).unwrap() {
-            let entry = entry.unwrap();
-            let path = entry.path();
-            let metadata = entry.metadata().unwrap();
-            let file_type = metadata.file_type();
+            for entry in mirror.read_dir(&path).unwrap() {
+                let path = entry.path();
+                let metadata = entry.metadata().unwrap();
+                let file_type = metadata.file_type();
 
-            let kind = if file_type.is_dir() {
-                fuser::FileType::Directory
-            } else if file_type.is_file() {
-                fuser::FileType::RegularFile
-            } else if file_type.is_symlink() {
-                fuser::FileType::Symlink
-            } else {
-                continue;
-            };
+                let kind = if file_type.is_dir() {
+                    fuser::FileType::Directory
+                } else if file_type.is_file() {
+                    fuser::FileType::RegularFile
+                } else if file_type.is_symlink() {
+                    fuser::FileType::Symlink
+                } else {
+                    continue;
+                };
 
-            let attr = self.create_attr(
-                kind,
-                (metadata.mode() & 0o777) as u16,
-                metadata.uid(),
-                metadata.gid(),
-                Some(metadata.len()),
-            );
+                let attr = self.create_attr(
+                    kind,
+                    (metadata.mode() & 0o777) as u16,
+                    metadata.uid(),
+                    metadata.gid(),
+                    Some(metadata.len()),
+                );
 
-            let new_node = if kind == fuser::FileType::Directory {
-                Node::new_directory_on_disk(attr)
-            } else if kind == fuser::FileType::RegularFile {
-                Node::new_file_on_disk(attr)
-            } else {
-                let target = fs::read_link(&path).unwrap();
-                Node::new_symbolic_link(attr, &target)
-            };
-            new_dir.insert(entry.file_name().as_os_str(), attr.ino)?;
-            new_nodes.push((new_node, entry.file_name().as_os_str().to_owned()));
-        }
+                let new_node = if kind == fuser::FileType::Directory {
+                    Node::new_directory_on_disk(attr)
+                } else if kind == fuser::FileType::RegularFile {
+                    Node::new_file_on_disk(attr)
+                } else {
+                    let target = mirror.read_link(&path).unwrap();
+                    Node::new_symbolic_link(attr, &target)
+                };
+                new_dir.insert(entry.file_name().as_os_str(), attr.ino)?;
+                new_nodes.push((new_node, entry.file_name().as_os_str().to_owned()));
+            }
 
-        let mut nodes = self.nodes.write().unwrap();
-        for (node, name) in new_nodes {
-            let attr = node.attr;
-            nodes.insert(node)?;
-            nodes.add_parent(attr.ino, ino, &name);
-        }
-        let node = nodes.get_mut(ino)?;
-        if let NodeKind::Directory(dir_kind) = &mut node.kind {
-            *dir_kind = DirectoryKind::InMemory(new_dir);
+            let mut nodes = self.nodes.write().unwrap();
+            for (node, name) in new_nodes {
+                let attr = node.attr;
+                nodes.insert(node)?;
+                nodes.add_parent(attr.ino, ino, &name);
+            }
+            let node = nodes.get_mut(ino)?;
+            if let NodeKind::Directory(dir_kind) = &mut node.kind {
+                *dir_kind = DirectoryKind::InMemory(new_dir);
+            }
         }
         Ok(())
     }
@@ -246,7 +245,7 @@ impl MemoryFuse {
                 if let Some(ctime) = ctime { attr_clone.ctime = ctime; }
                 if let Some(flags) = flags { attr_clone.flags = flags; }
                 node.attr = attr_clone;
-                if let Some(worker) = &self.disk_worker {
+                if let Some(worker) = &self.mirror_worker {
                     worker.sender().send(WriteJob::SetAttr { ino, attr: attr_clone }).unwrap();
                 }
                 return Ok(attr_clone);
@@ -256,8 +255,7 @@ impl MemoryFuse {
         let data = if let Some(data_arc) = data_arc {
             data_arc
         } else {
-            let fs_path = self.disk_worker.as_ref().unwrap().image().get_fs_path(&path.unwrap());
-            let new_data = fs::read(fs_path).unwrap_or_default();
+            let new_data = self.mirror.as_ref().unwrap().read_file(&path.unwrap()).unwrap_or_default();
             Arc::new(RwLock::new(new_data))
         };
 
@@ -305,7 +303,7 @@ impl MemoryFuse {
             }
         }
 
-        if let Some(worker) = &self.disk_worker {
+        if let Some(worker) = &self.mirror_worker {
             worker.sender().send(WriteJob::SetAttr { ino, attr }).unwrap();
             if size.is_some() {
                 worker.sender().send(WriteJob::Write { ino }).unwrap();
@@ -341,7 +339,7 @@ impl MemoryFuse {
         let dir = nodes.get_dir_mut(parent)?;
         dir.insert(name, attr.ino)?;
         nodes.add_parent(attr.ino, parent, name);
-        if let Some(worker) = &self.disk_worker {
+        if let Some(worker) = &self.mirror_worker {
             worker
                 .sender()
                 .send(WriteJob::CreateFile { parent, name: name.to_owned(), attr })
@@ -371,7 +369,7 @@ impl MemoryFuse {
         let dir = nodes.get_dir_mut(parent)?;
         dir.insert(name, attr.ino)?;
         nodes.add_parent(attr.ino, parent, name);
-        if let Some(worker) = &self.disk_worker {
+        if let Some(worker) = &self.mirror_worker {
             worker
                 .sender()
                 .send(WriteJob::CreateDir { parent, name: name.to_owned(), attr })
@@ -401,7 +399,7 @@ impl MemoryFuse {
         let dir = nodes.get_dir_mut(parent)?;
         dir.insert(link_name, attr.ino)?;
         nodes.add_parent(attr.ino, parent, link_name);
-        if let Some(worker) = &self.disk_worker {
+        if let Some(worker) = &self.mirror_worker {
             worker
                 .sender()
                 .send(WriteJob::CreateSymlink {
@@ -432,7 +430,7 @@ impl MemoryFuse {
             let dir = nodes.get_dir_mut(new_parent)?;
             dir.insert(new_name, ino)?;
             nodes.add_parent(ino, new_parent, new_name);
-            if let Some(worker) = &self.disk_worker {
+            if let Some(worker) = &self.mirror_worker {
                 worker
                     .sender()
                     .send(WriteJob::Link {
@@ -471,7 +469,7 @@ impl MemoryFuse {
 
         let mut nodes = self.nodes.write().unwrap();
         nodes.remove_parent(ino, parent, name);
-        if let Some(worker) = &self.disk_worker {
+        if let Some(worker) = &self.mirror_worker {
             worker
                 .sender()
                 .send(WriteJob::Delete {
@@ -556,7 +554,7 @@ impl MemoryFuse {
         nodes.get_dir_mut(newparent)?.insert(newname, old_ino)?;
         nodes.add_parent(old_ino, newparent, newname);
 
-        if let Some(worker) = &self.disk_worker {
+        if let Some(worker) = &self.mirror_worker {
             worker
                 .sender()
                 .send(WriteJob::Rename {
@@ -591,8 +589,7 @@ impl MemoryFuse {
         let data_arc = if let Some(content) = content {
             content
         } else {
-            let fs_path = self.disk_worker.as_ref().unwrap().image().get_fs_path(&path.unwrap());
-            let new_data = fs::read(fs_path).unwrap_or_default();
+            let new_data = self.mirror.as_ref().unwrap().read_file(&path.unwrap()).unwrap_or_default();
             let new_data_arc = Arc::new(RwLock::new(new_data));
 
             let evicted = self.lru_manager.put(ino, new_data_arc.clone(), &self.nodes);
@@ -645,8 +642,7 @@ impl MemoryFuse {
         let data = if let Some(data_arc) = data_arc {
             data_arc
         } else {
-            let fs_path = self.disk_worker.as_ref().unwrap().image().get_fs_path(&path.unwrap());
-            let new_data = fs::read(fs_path).unwrap_or_default();
+            let new_data = self.mirror.as_ref().unwrap().read_file(&path.unwrap()).unwrap_or_default();
             Arc::new(RwLock::new(new_data))
         };
 
@@ -694,7 +690,7 @@ impl MemoryFuse {
                     }
                 }
             }
-            if let Some(worker) = &self.disk_worker {
+            if let Some(worker) = &self.mirror_worker {
                 worker.sender().send(WriteJob::Write { ino }).unwrap();
             }
         }
@@ -723,7 +719,7 @@ impl Filesystem for MemoryFuse {
 
     fn destroy(&mut self) {
         info!("destroying");
-        if let Some(worker) = self.disk_worker.take() {
+        if let Some(worker) = self.mirror_worker.take() {
             worker.stop();
         }
     }
@@ -1147,7 +1143,8 @@ mod tests {
     fn test_disk_mirroring() {
         let dir = tempdir().unwrap();
         let image_path = dir.path().to_path_buf();
-        let mut fuse = MemoryFuse::new(Some(image_path.clone()), 500 * 1024 * 1024, false);
+        let mirror = LocalMirror::new(image_path.clone());
+        let mut fuse = MemoryFuse::new(Some(Arc::new(mirror)), 500 * 1024 * 1024, false);
 
         // 1. Create a directory
         let dir_name = OsStr::new("mydir");
@@ -1238,8 +1235,9 @@ mod tests {
     fn test_lru_eviction() {
         let dir = tempdir().unwrap();
         let image_path = dir.path().to_path_buf();
+        let mirror = LocalMirror::new(image_path.clone());
         // 1MB cache size
-        let mut fuse = MemoryFuse::new(Some(image_path.clone()), 1024 * 1024, false);
+        let mut fuse = MemoryFuse::new(Some(Arc::new(mirror)), 1024 * 1024, false);
 
         // Create file 1 (0.6 MB)
         let file1_name = OsStr::new("file1.txt");
@@ -1354,7 +1352,8 @@ mod tests {
         fs::write(&file_path, "hello").unwrap();
 
         // 2. Start MemoryFuse with lazy loading enabled
-        let mut fuse = MemoryFuse::new(Some(image_path.clone()), 1024 * 1024, true);
+        let mirror = LocalMirror::new(image_path.clone());
+        let mut fuse = MemoryFuse::new(Some(Arc::new(mirror)), 1024 * 1024, true);
 
         // 3. Verify that initially, only the root directory is loaded
         {

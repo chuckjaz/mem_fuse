@@ -2,13 +2,17 @@ use clap::Parser;
 use env_logger::Env;
 use log::info;
 use std::error::Error;
-use std::{ffi::OsString, path::{Path, PathBuf}};
+use std::{ffi::OsString, path::Path, sync::Arc};
 use std::result::Result;
-mod disk_image;
+use mem_fuse::MemoryFuse;
+use mirror::Mirror;
 mod lru_cache;
 mod mem_fuse;
 mod node;
 mod dirty;
+mod mirror;
+mod mirror_factory;
+mod web_mirror;
 
 #[derive(Debug, Parser)]
 #[command(name = "mem_fuse")]
@@ -18,9 +22,9 @@ mod dirty;
 pub struct FuseCommand {
     /// The location to mount the directory
     path: OsString,
-    /// The location to save the image to
+    /// The location of the mirror
     #[arg(short, long)]
-    disk_image_path: Option<PathBuf>,
+    mirror: Option<String>,
     /// The size of the lru cache in Mb
     #[arg(long, default_value_t = 500)]
     cache_size: u64,
@@ -39,7 +43,7 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
     let path = Path::new(&path_text);
     start_fuse(
         path,
-        config.disk_image_path,
+        config.mirror,
         config.cache_size * 1024 * 1024,
         config.lazy_load,
     )?;
@@ -47,13 +51,17 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
     Ok(())
 }
 
+use crate::mirror_factory::create_mirror;
+
 fn start_fuse(
     path: &Path,
-    disk_image_path: Option<PathBuf>,
+    mirror: Option<String>,
     cache_size: u64,
     lazy_load: bool,
 ) -> Result<(), Box<dyn Error + Sync + Send>> {
-    let filesystem = mem_fuse::MemoryFuse::new(disk_image_path, cache_size, lazy_load);
+    let mirror: Option<Arc<dyn Mirror + Send + Sync>> =
+        mirror.map(|mirror_str| create_mirror(&mirror_str));
+    let filesystem = MemoryFuse::new(mirror, cache_size, lazy_load);
     fuser::mount2(filesystem, path, &[])?;
     Ok(())
 }
