@@ -11,7 +11,7 @@ mod node;
 mod dirty;
 
 #[derive(Debug, Parser)]
-#[command(name = "inv-fuse")]
+#[command(name = "mem_fuse")]
 #[command(author = "Chuck Jazdzewski (chuckjaz@gmail.com)")]
 #[command(version = "0.1.0")]
 #[command(about = "An in-memory FUSE")]
