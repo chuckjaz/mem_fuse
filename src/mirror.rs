@@ -11,7 +11,10 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use fuser::FileAttr;
+use std::os::unix::fs::MetadataExt;
+use std::time::SystemTime;
+
+use fuser::{FileAttr, FileType};
 use libc::{c_int, ENOENT};
 use log::{debug, info};
 use crate::node::{FileContent, NodeKind, Nodes};
@@ -87,10 +90,12 @@ pub enum WriteJob {
         attr: FileAttr,
     },
     Delete {
+        ino: u64,
         parent: u64,
         name: OsString,
     },
     Rename {
+        ino: u64,
         parent: u64,
         name: OsString,
         new_parent: u64,
@@ -193,16 +198,17 @@ impl MirrorWorker {
             WriteJob::SetAttr { ino, attr } => {
                 mirror.set_attr(ino, &attr, Some(attr.size), &path_resolver)?;
             }
-            WriteJob::Delete { parent, name } => {
-                mirror.delete(parent, &name, &path_resolver)?;
+            WriteJob::Delete { ino, parent, name } => {
+                mirror.delete(ino, parent, &name, &path_resolver)?;
             }
             WriteJob::Rename {
+                ino,
                 parent,
                 name,
                 new_parent,
                 new_name,
             } => {
-                mirror.rename(parent, &name, new_parent, &new_name, &path_resolver)?;
+                mirror.rename(ino, parent, &name, new_parent, &new_name, &path_resolver)?;
             }
             WriteJob::Link {
                 ino,
@@ -230,8 +236,18 @@ impl MirrorWorker {
     }
 }
 
+#[derive(Debug)]
+pub struct MirrorDirEntry {
+    pub name: OsString,
+    pub attr: FileAttr,
+}
+
 pub trait Mirror: Debug {
-    fn read_dir<'a>(&self, ino: u64, path_resolver: &PathResolver<'a>) -> std::io::Result<Vec<fs::DirEntry>>;
+    fn read_dir<'a>(
+        &self,
+        ino: u64,
+        path_resolver: &PathResolver<'a>,
+    ) -> std::io::Result<Vec<MirrorDirEntry>>;
     fn read_link<'a>(&self, ino: u64, path_resolver: &PathResolver<'a>) -> std::io::Result<PathBuf>;
     fn read_file<'a>(&self, ino: u64, path_resolver: &PathResolver<'a>) -> std::io::Result<Vec<u8>>;
     fn create_file<'a>(
@@ -273,9 +289,16 @@ pub trait Mirror: Debug {
         size: Option<u64>,
         path_resolver: &PathResolver<'a>,
     ) -> std::io::Result<()>;
-    fn delete<'a>(&self, parent: u64, name: &OsString, path_resolver: &PathResolver<'a>) -> std::io::Result<()>;
+    fn delete<'a>(
+        &self,
+        ino: u64,
+        parent: u64,
+        name: &OsString,
+        path_resolver: &PathResolver<'a>,
+    ) -> std::io::Result<()>;
     fn rename<'a>(
         &self,
+        ino: u64,
         parent: u64,
         name: &OsString,
         new_parent: u64,
@@ -316,12 +339,48 @@ impl LocalMirror {
 }
 
 impl Mirror for LocalMirror {
-    fn read_dir<'a>(&self, ino: u64, path_resolver: &PathResolver<'a>) -> std::io::Result<Vec<fs::DirEntry>> {
+    fn read_dir<'a>(
+        &self,
+        ino: u64,
+        path_resolver: &PathResolver<'a>,
+    ) -> std::io::Result<Vec<MirrorDirEntry>> {
         let path = path_resolver.resolve(ino)?;
         let fs_path = self.get_fs_path(&path);
         let mut entries = Vec::new();
         for entry in fs::read_dir(fs_path)? {
-            entries.push(entry?);
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            let file_type = metadata.file_type();
+            let kind = if file_type.is_dir() {
+                FileType::Directory
+            } else if file_type.is_file() {
+                FileType::RegularFile
+            } else {
+                FileType::Symlink
+            };
+
+            let attr = FileAttr {
+                ino: metadata.ino(),
+                size: metadata.len(),
+                blocks: metadata.blocks(),
+                atime: metadata.accessed().unwrap_or(SystemTime::now()),
+                mtime: metadata.modified().unwrap_or(SystemTime::now()),
+                ctime: metadata.created().unwrap_or(SystemTime::now()),
+                crtime: metadata.created().unwrap_or(SystemTime::now()),
+                kind,
+                perm: metadata.permissions().mode() as u16,
+                nlink: metadata.nlink() as u32,
+                uid: metadata.uid(),
+                gid: metadata.gid(),
+                rdev: metadata.rdev() as u32,
+                blksize: metadata.blksize() as u32,
+                flags: 0,
+            };
+
+            entries.push(MirrorDirEntry {
+                name: entry.file_name(),
+                attr,
+            });
         }
         Ok(entries)
     }
@@ -424,7 +483,13 @@ impl Mirror for LocalMirror {
         Ok(())
     }
 
-    fn delete<'a>(&self, parent: u64, name: &OsString, path_resolver: &PathResolver<'a>) -> std::io::Result<()> {
+    fn delete<'a>(
+        &self,
+        _ino: u64,
+        parent: u64,
+        name: &OsString,
+        path_resolver: &PathResolver<'a>,
+    ) -> std::io::Result<()> {
         let path = path_resolver.resolve_parent(parent, name)?;
         let fs_path = self.get_fs_path(&path);
         if fs_path.is_dir() {
@@ -436,6 +501,7 @@ impl Mirror for LocalMirror {
 
     fn rename<'a>(
         &self,
+        _ino: u64,
         parent: u64,
         name: &OsString,
         new_parent: u64,
