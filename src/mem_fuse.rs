@@ -81,6 +81,8 @@ impl MemoryFuse {
                         let target = fs::read_link(&path).unwrap();
                         Node::new_symbolic_link(attr, &target)
                     };
+                    let root_node = nodes.get_mut(1).unwrap();
+                    let dir = root_node.get_dir_mut().unwrap();
                     dir.insert(entry.file_name().as_os_str(), attr.ino)
                         .unwrap();
                     nodes.add_parent(attr.ino, 1, entry.file_name().as_os_str());
@@ -122,9 +124,13 @@ impl MemoryFuse {
 
     fn lookup_node(&mut self, parent: u64, name: &OsStr) -> Result<FileAttr> {
         self.load_directory(parent)?;
-        let mut nodes = self.nodes.write().unwrap();
-        let node = nodes.find(parent, name)?;
-        Ok(node.attr)
+        let attr = {
+            let mut nodes = self.nodes.write().unwrap();
+            let node = nodes.find(parent, name)?;
+            node.attr
+        };
+        self.load_directory(attr.ino)?;
+        Ok(attr)
     }
 
     fn get_attr(&self, ino: u64) -> Result<FileAttr> {
@@ -134,6 +140,17 @@ impl MemoryFuse {
     }
 
     fn load_directory(&mut self, ino: u64) -> Result<()> {
+        {
+            let nodes = self.nodes.read().unwrap();
+            let node = nodes.get(ino)?;
+            if let NodeKind::Directory(dir_kind) = &node.kind {
+                if !dir_kind.is_ondisk() {
+                    return Ok(());
+                }
+            } else {
+                return Ok(());
+            }
+        }
         let path = {
             let nodes = self.nodes.read().unwrap();
             build_path(&nodes, ino)?
