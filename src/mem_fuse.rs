@@ -38,6 +38,7 @@ impl MemoryFuse {
                     0o755,
                     get_current_uid(),
                     get_current_gid(),
+                    None,
                 );
                 let root = Node::new_directory(root_attr);
                 let _ = nodes.insert(root);
@@ -70,6 +71,7 @@ impl MemoryFuse {
                         (metadata.mode() & 0o777) as u16,
                         metadata.uid(),
                         metadata.gid(),
+                        Some(metadata.len()),
                     );
 
                     let node = if kind == fuser::FileType::Directory {
@@ -95,6 +97,7 @@ impl MemoryFuse {
                 0o755,
                 get_current_uid(),
                 get_current_gid(),
+                None,
             );
             let root = Node::new_directory(attr);
             let _ = nodes.insert(root);
@@ -116,9 +119,9 @@ impl MemoryFuse {
         }
     }
 
-    pub fn create_attr(&mut self, kind: fuser::FileType, perm: u16, uid: u32, gid: u32) -> fuser::FileAttr {
+    pub fn create_attr(&mut self, kind: fuser::FileType, perm: u16, uid: u32, gid: u32, size: Option<u64>) -> fuser::FileAttr {
         let ino = self.next_ino.fetch_add(1, Ordering::Relaxed) as u64;
-        new_attr(ino, kind, perm, uid, gid)
+        new_attr(ino, kind, perm, uid, gid, size)
     }
 
     fn lookup_node(&mut self, parent: u64, name: &OsStr) -> Result<FileAttr> {
@@ -180,6 +183,7 @@ impl MemoryFuse {
                 (metadata.mode() & 0o777) as u16,
                 metadata.uid(),
                 metadata.gid(),
+                Some(metadata.len()),
             );
 
             let new_node = if kind == fuser::FileType::Directory {
@@ -331,6 +335,7 @@ impl MemoryFuse {
             mode as u16,
             uid,
             gid,
+            None,
         );
         let mut nodes = self.nodes.write().unwrap();
         let dir = nodes.get_dir_mut(parent)?;
@@ -360,6 +365,7 @@ impl MemoryFuse {
             mode as u16,
             uid,
             gid,
+            None,
         );
         let mut nodes = self.nodes.write().unwrap();
         let dir = nodes.get_dir_mut(parent)?;
@@ -389,6 +395,7 @@ impl MemoryFuse {
             0o777,
             uid,
             gid,
+            None,
         );
         let mut nodes = self.nodes.write().unwrap();
         let dir = nodes.get_dir_mut(parent)?;
@@ -1077,11 +1084,12 @@ fn new_attr(
         perm: u16,
         uid: u32,
         gid: u32,
+        size: Option<u64>,
 ) -> fuser::FileAttr {
     let now = SystemTime::now();
     fuser::FileAttr {
         ino,
-        size: 0u64,
+        size: size.unwrap_or(0),
         blocks: 1u64,
         atime: now,
         mtime: now,
