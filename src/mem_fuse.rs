@@ -9,9 +9,10 @@ use libc::{RENAME_NOREPLACE, RENAME_EXCHANGE};
 use log::{debug, info};
 use users::{get_current_gid, get_current_uid};
 
-use crate::disk_image::{build_path, DiskImageWorker, WriteJob};
+use crate::disk_image::{build_path, DiskImage, DiskImageWorker, WriteJob};
 use crate::lru_cache::LruManager;
-use crate::node::{FileContent, Node, NodeKind, Nodes};
+use crate::node::{DirectoryKind, FileContent, Node, NodeKind, Nodes};
+use std::os::unix::fs::MetadataExt;
 
 pub(crate) type Result<T> = std::result::Result<T, c_int>;
 
@@ -23,17 +24,81 @@ pub struct MemoryFuse {
 }
 
 impl MemoryFuse {
-    pub fn new(disk_image_path: Option<PathBuf>, cache_size: u64) -> MemoryFuse {
-        let attr = new_attr(
-            1,
-            fuser::FileType::Directory,
-            0o755,
-            get_current_uid(),
-            get_current_gid(),
-        );
+    pub fn new(disk_image_path: Option<PathBuf>, cache_size: u64, lazy_load: bool) -> MemoryFuse {
         let mut nodes = Nodes::new();
-        let root = Node::new_directory(attr);
-        let _ = nodes.insert(root);
+        let mut next_ino = 2;
+
+        let next_ino_atomic = AtomicUsize::new(2);
+        if lazy_load {
+            if let Some(path) = &disk_image_path {
+                let image = DiskImage::new(path.clone());
+                let fs_path = image.get_fs_path(Path::new(""));
+                let root_attr = new_attr(
+                    1,
+                    fuser::FileType::Directory,
+                    0o755,
+                    get_current_uid(),
+                    get_current_gid(),
+                );
+                let root = Node::new_directory(root_attr);
+                let _ = nodes.insert(root);
+
+                let mut new_entries = Vec::new();
+                for entry in fs::read_dir(fs_path).unwrap() {
+                    let entry = entry.unwrap();
+                    new_entries.push(entry);
+                }
+
+                for entry in new_entries {
+                    let path = entry.path();
+                    let metadata = entry.metadata().unwrap();
+                    let file_type = metadata.file_type();
+
+                    let kind = if file_type.is_dir() {
+                        fuser::FileType::Directory
+                    } else if file_type.is_file() {
+                        fuser::FileType::RegularFile
+                    } else if file_type.is_symlink() {
+                        fuser::FileType::Symlink
+                    } else {
+                        continue;
+                    };
+
+                    let ino = next_ino_atomic.fetch_add(1, Ordering::Relaxed) as u64;
+                    let attr = new_attr(
+                        ino,
+                        kind,
+                        (metadata.mode() & 0o777) as u16,
+                        metadata.uid(),
+                        metadata.gid(),
+                    );
+
+                    let node = if kind == fuser::FileType::Directory {
+                        Node::new_directory_on_disk(attr)
+                    } else if kind == fuser::FileType::RegularFile {
+                        Node::new_file_on_disk(attr)
+                    } else {
+                        let target = fs::read_link(&path).unwrap();
+                        Node::new_symbolic_link(attr, &target)
+                    };
+                    dir.insert(entry.file_name().as_os_str(), attr.ino)
+                        .unwrap();
+                    nodes.add_parent(attr.ino, 1, entry.file_name().as_os_str());
+                    nodes.insert(node).unwrap();
+                }
+            }
+        } else {
+            let attr = new_attr(
+                1,
+                fuser::FileType::Directory,
+                0o755,
+                get_current_uid(),
+                get_current_gid(),
+            );
+            let root = Node::new_directory(attr);
+            let _ = nodes.insert(root);
+        }
+
         let nodes = Arc::new(RwLock::new(nodes));
 
         let cache_cond = Arc::new(Condvar::new());
@@ -44,18 +109,19 @@ impl MemoryFuse {
 
         Self {
             nodes,
-            next_ino: AtomicUsize::new(2),
+            next_ino: next_ino_atomic,
             disk_worker,
             lru_manager,
         }
     }
 
-    pub fn create_attr(&mut self, kind: fuser::FileType, perm: u16, uid: u32, gid: u32) -> fuser:: FileAttr {
+    pub fn create_attr(&mut self, kind: fuser::FileType, perm: u16, uid: u32, gid: u32) -> fuser::FileAttr {
         let ino = self.next_ino.fetch_add(1, Ordering::Relaxed) as u64;
         new_attr(ino, kind, perm, uid, gid)
     }
 
     fn lookup_node(&mut self, parent: u64, name: &OsStr) -> Result<FileAttr> {
+        self.load_directory(parent)?;
         let mut nodes = self.nodes.write().unwrap();
         let node = nodes.find(parent, name)?;
         Ok(node.attr)
@@ -65,6 +131,64 @@ impl MemoryFuse {
         let nodes = self.nodes.read().unwrap();
         let node = nodes.get(ino)?;
         Ok(node.attr)
+    }
+
+    fn load_directory(&mut self, ino: u64) -> Result<()> {
+        let path = {
+            let nodes = self.nodes.read().unwrap();
+            build_path(&nodes, ino)?
+        };
+        let fs_path = self.disk_worker.as_ref().unwrap().image().get_fs_path(&path);
+
+        let mut new_dir = crate::node::Directory::new();
+        let mut new_nodes = Vec::new();
+
+        for entry in fs::read_dir(fs_path).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let metadata = entry.metadata().unwrap();
+            let file_type = metadata.file_type();
+
+            let kind = if file_type.is_dir() {
+                fuser::FileType::Directory
+            } else if file_type.is_file() {
+                fuser::FileType::RegularFile
+            } else if file_type.is_symlink() {
+                fuser::FileType::Symlink
+            } else {
+                continue;
+            };
+
+            let attr = self.create_attr(
+                kind,
+                (metadata.mode() & 0o777) as u16,
+                metadata.uid(),
+                metadata.gid(),
+            );
+
+            let new_node = if kind == fuser::FileType::Directory {
+                Node::new_directory_on_disk(attr)
+            } else if kind == fuser::FileType::RegularFile {
+                Node::new_file_on_disk(attr)
+            } else {
+                let target = fs::read_link(&path).unwrap();
+                Node::new_symbolic_link(attr, &target)
+            };
+            new_dir.insert(entry.file_name().as_os_str(), attr.ino)?;
+            new_nodes.push((new_node, entry.file_name().as_os_str().to_owned()));
+        }
+
+        let mut nodes = self.nodes.write().unwrap();
+        for (node, name) in new_nodes {
+            let attr = node.attr;
+            nodes.insert(node)?;
+            nodes.add_parent(attr.ino, ino, &name);
+        }
+        let node = nodes.get_mut(ino)?;
+        if let NodeKind::Directory(dir_kind) = &mut node.kind {
+            *dir_kind = DirectoryKind::InMemory(new_dir);
+        }
+        Ok(())
     }
 
     fn set_attr(
@@ -185,11 +309,12 @@ impl MemoryFuse {
         uid: u32,
         gid: u32,
     ) -> Result<FileAttr> {
+        self.load_directory(parent)?;
         let attr = self.create_attr(
             fuser::FileType::RegularFile,
             mode as u16,
             uid,
-            gid
+            gid,
         );
         let mut nodes = self.nodes.write().unwrap();
         let dir = nodes.get_dir_mut(parent)?;
@@ -213,11 +338,12 @@ impl MemoryFuse {
         uid: u32,
         gid: u32,
     ) -> Result<FileAttr> {
+        self.load_directory(parent)?;
         let attr = self.create_attr(
             fuser::FileType::Directory,
             mode as u16,
             uid,
-            gid
+            gid,
         );
         let mut nodes = self.nodes.write().unwrap();
         let dir = nodes.get_dir_mut(parent)?;
@@ -241,11 +367,12 @@ impl MemoryFuse {
         uid: u32,
         gid: u32,
     ) -> Result<FileAttr> {
+        self.load_directory(parent)?;
         let attr = self.create_attr(
             fuser::FileType::Symlink,
             0o777,
             uid,
-            gid
+            gid,
         );
         let mut nodes = self.nodes.write().unwrap();
         let dir = nodes.get_dir_mut(parent)?;
@@ -272,6 +399,7 @@ impl MemoryFuse {
         new_parent: u64,
         new_name: &std::ffi::OsStr,
     ) -> Result<FileAttr> {
+        self.load_directory(new_parent)?;
         let mut nodes = self.nodes.write().unwrap();
         let attr = {
             let node = nodes.get(ino)?;
@@ -300,6 +428,7 @@ impl MemoryFuse {
     }
 
     fn unlink_node(&mut self, parent: u64, name: &OsStr) -> Result<()> {
+        self.load_directory(parent)?;
         let (ino, nlink) = {
             let mut nodes = self.nodes.write().unwrap();
             let ino = {
@@ -339,6 +468,8 @@ impl MemoryFuse {
         newname: &OsStr,
         flags: u32,
     ) -> Result<()> {
+        self.load_directory(parent)?;
+        self.load_directory(newparent)?;
         let allow_overwrite = {
             #[cfg(target_os = "linux")]
             {
@@ -548,7 +679,8 @@ impl MemoryFuse {
         Ok(new_data.len())
     }
 
-    fn read_directory(&self, ino: u64) -> Result<Vec<(OsString, FileAttr)>> {
+    fn read_directory(&mut self, ino: u64) -> Result<Vec<(OsString, FileAttr)>> {
+        self.load_directory(ino)?;
         let nodes = self.nodes.read().unwrap();
         let dir = nodes.get_dir_anon(ino)?;
         let mut entries = Vec::new();
@@ -991,7 +1123,7 @@ mod tests {
     fn test_disk_mirroring() {
         let dir = tempdir().unwrap();
         let image_path = dir.path().to_path_buf();
-        let mut fuse = MemoryFuse::new(Some(image_path.clone()), 500 * 1024 * 1024);
+        let mut fuse = MemoryFuse::new(Some(image_path.clone()), 500 * 1024 * 1024, false);
 
         // 1. Create a directory
         let dir_name = OsStr::new("mydir");
@@ -1083,7 +1215,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let image_path = dir.path().to_path_buf();
         // 1MB cache size
-        let mut fuse = MemoryFuse::new(Some(image_path.clone()), 1024 * 1024);
+        let mut fuse = MemoryFuse::new(Some(image_path.clone()), 1024 * 1024, false);
 
         // Create file 1 (0.6 MB)
         let file1_name = OsStr::new("file1.txt");
@@ -1150,7 +1282,7 @@ mod tests {
     #[test]
     fn test_lru_eviction_dirty() {
         // 1MB cache size, no disk worker
-        let mut fuse = MemoryFuse::new(None, 1024 * 1024);
+        let mut fuse = MemoryFuse::new(None, 1024 * 1024, false);
 
         // Create file 1 (0.6 MB)
         let file1_name = OsStr::new("file1.txt");
@@ -1184,6 +1316,62 @@ mod tests {
                 panic!("Node2 is not a file");
             }
         }
+    }
+
+    #[test]
+    fn test_lazy_load() {
+        let dir = tempdir().unwrap();
+        let image_path = dir.path().to_path_buf();
+
+        // 1. Create a disk image with some files and directories
+        let sub_dir_path = image_path.join("sub");
+        fs::create_dir(&sub_dir_path).unwrap();
+        let file_path = sub_dir_path.join("file.txt");
+        fs::write(&file_path, "hello").unwrap();
+
+        // 2. Start MemoryFuse with lazy loading enabled
+        let mut fuse = MemoryFuse::new(Some(image_path.clone()), 1024 * 1024, true);
+
+        // 3. Verify that initially, only the root directory is loaded
+        {
+            let nodes = fuse.nodes.read().unwrap();
+            let root = nodes.get(1).unwrap();
+            if let NodeKind::Directory(dir_kind) = &root.kind {
+                assert!(!dir_kind.is_ondisk());
+            } else {
+                panic!("Root is not a directory");
+            }
+            assert_eq!(nodes.get_dir_anon(1).unwrap().iter().count(), 1);
+            let sub_dir_ino = nodes.get_dir_anon(1).unwrap().get(OsStr::new("sub")).unwrap();
+            let sub_dir_node = nodes.get(sub_dir_ino).unwrap();
+            if let NodeKind::Directory(dir_kind) = &sub_dir_node.kind {
+                assert!(dir_kind.is_ondisk());
+            } else {
+                panic!("Sub dir is not a directory");
+            }
+        }
+
+        // 4. Perform a lookup on the subdirectory and verify that it gets loaded on demand
+        let sub_dir_attr = fuse.lookup_node(1, OsStr::new("sub")).unwrap();
+        {
+            let nodes = fuse.nodes.read().unwrap();
+            let sub_dir_node = nodes.get(sub_dir_attr.ino).unwrap();
+            if let NodeKind::Directory(dir_kind) = &sub_dir_node.kind {
+                assert!(!dir_kind.is_ondisk());
+            } else {
+                panic!("Sub dir is not a directory");
+            }
+        }
+
+        // 5. Perform a readdir on the subdirectory and verify that the file is listed
+        let entries = fuse.read_directory(sub_dir_attr.ino).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "file.txt");
+
+        // 6. Read the file and verify its contents
+        let file_attr = entries[0].1;
+        let data = fuse.read_file(file_attr.ino, 0, 1024).unwrap();
+        assert_eq!(data, b"hello");
     }
 }
 

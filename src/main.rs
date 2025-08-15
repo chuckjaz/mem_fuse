@@ -24,6 +24,9 @@ pub struct FuseCommand {
     /// The size of the lru cache in Mb
     #[arg(long, default_value_t = 500)]
     cache_size: u64,
+    /// Load files from the disk image lazily
+    #[arg(long, default_value_t = false)]
+    lazy_load: bool,
 }
 
 fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
@@ -38,6 +41,7 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
         path,
         config.disk_image_path,
         config.cache_size * 1024 * 1024,
+        config.lazy_load,
     )?;
 
     Ok(())
@@ -47,8 +51,9 @@ fn start_fuse(
     path: &Path,
     disk_image_path: Option<PathBuf>,
     cache_size: u64,
+    lazy_load: bool,
 ) -> Result<(), Box<dyn Error + Sync + Send>> {
-    let filesystem = mem_fuse::MemoryFuse::new(disk_image_path, cache_size);
+    let filesystem = mem_fuse::MemoryFuse::new(disk_image_path, cache_size, lazy_load);
     fuser::mount2(filesystem, path, &[])?;
     Ok(())
 }
