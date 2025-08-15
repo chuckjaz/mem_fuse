@@ -35,6 +35,7 @@ impl Mirror for WebMirror {
 
     fn create_file<'a>(
         &self,
+        _ino: u64,
         _parent: u64,
         _name: &OsString,
         _attr: &FileAttr,
@@ -45,6 +46,7 @@ impl Mirror for WebMirror {
 
     fn create_dir<'a>(
         &self,
+        _ino: u64,
         _parent: u64,
         _name: &OsString,
         _attr: &FileAttr,
@@ -55,6 +57,7 @@ impl Mirror for WebMirror {
 
     fn create_symlink<'a>(
         &self,
+        _ino: u64,
         _parent: u64,
         _name: &OsString,
         _target: &Path,

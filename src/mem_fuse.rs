@@ -351,7 +351,7 @@ impl MemoryFuse {
         if let Some(worker) = &self.mirror_worker {
             worker
                 .sender()
-                .send(WriteJob::CreateFile { parent, name: name.to_owned(), attr })
+                .send(WriteJob::CreateFile { ino: attr.ino, parent, name: name.to_owned(), attr })
                 .unwrap();
         }
         let node = Node::new_file(attr);
@@ -381,7 +381,7 @@ impl MemoryFuse {
         if let Some(worker) = &self.mirror_worker {
             worker
                 .sender()
-                .send(WriteJob::CreateDir { parent, name: name.to_owned(), attr })
+                .send(WriteJob::CreateDir { ino: attr.ino, parent, name: name.to_owned(), attr })
                 .unwrap();
         }
         let node = Node::new_directory(attr);
@@ -412,6 +412,7 @@ impl MemoryFuse {
             worker
                 .sender()
                 .send(WriteJob::CreateSymlink {
+                    ino: attr.ino,
                     parent,
                     name: link_name.to_owned(),
                     target: target.to_path_buf(),
