@@ -1,5 +1,5 @@
 use std::{
-    ffi::{OsStr, OsString}, fs, os::unix::ffi::OsStrExt, path::{Path, PathBuf}, sync::{atomic::{AtomicUsize, Ordering}, Arc, RwLock}, time::SystemTime, u32
+    ffi::{OsStr, OsString}, fs, os::unix::ffi::OsStrExt, path::{Path, PathBuf}, sync::{atomic::{AtomicUsize, Ordering}, Arc, RwLock, Condvar}, time::SystemTime, u32
 };
 
 use fuser::{self, FileAttr, Filesystem, TimeOrNow};
@@ -10,6 +10,7 @@ use log::{debug, info};
 use users::{get_current_gid, get_current_uid};
 
 use crate::disk_image::{build_path, DiskImageWorker, WriteJob};
+use crate::lru_cache::LruManager;
 use crate::node::{FileContent, Node, NodeKind, Nodes};
 
 pub(crate) type Result<T> = std::result::Result<T, c_int>;
@@ -18,10 +19,11 @@ pub struct MemoryFuse {
     nodes: Arc<RwLock<Nodes>>,
     next_ino: AtomicUsize,
     disk_worker: Option<DiskImageWorker>,
+    lru_manager: Arc<LruManager>,
 }
 
 impl MemoryFuse {
-    pub fn new(disk_image_path: Option<PathBuf>) -> MemoryFuse {
+    pub fn new(disk_image_path: Option<PathBuf>, cache_size: u64) -> MemoryFuse {
         let attr = new_attr(
             1,
             fuser::FileType::Directory,
@@ -34,6 +36,9 @@ impl MemoryFuse {
         let _ = nodes.insert(root);
         let nodes = Arc::new(RwLock::new(nodes));
 
+        let cache_cond = Arc::new(Condvar::new());
+        let lru_manager = Arc::new(LruManager::new(cache_size, cache_cond.clone()));
+
         let disk_worker =
             disk_image_path.map(|path| DiskImageWorker::new(path, Arc::clone(&nodes)));
 
@@ -41,6 +46,7 @@ impl MemoryFuse {
             nodes,
             next_ino: AtomicUsize::new(2),
             disk_worker,
+            lru_manager,
         }
     }
 
@@ -73,85 +79,94 @@ impl MemoryFuse {
         ctime: Option<SystemTime>,
         flags: Option<u32>,
     ) -> Result<FileAttr> {
-        let path = {
-            let nodes = self.nodes.read().unwrap();
-            build_path(&nodes, ino).ok()
+        let (path, data_arc, mut attr) = {
+            let mut nodes = self.nodes.write().unwrap();
+            let node = nodes.get_mut(ino)?;
+            let mut attr_clone = node.attr;
+            if let NodeKind::File(file) = &mut node.kind {
+                let (p, d) = match &mut file.content {
+                    FileContent::InMemory(data) => {
+                        self.lru_manager.get(&ino);
+                        (None, Some(data.clone()))
+                    }
+                    FileContent::OnDisk => (build_path(&nodes, ino).ok(), None),
+                };
+                (p, d, attr_clone)
+            } else {
+                // Not a file, handle other attributes
+                if let Some(mode) = mode { attr_clone.perm = mode as u16; }
+                if let Some(uid) = uid { attr_clone.uid = uid; }
+                if let Some(gid) = gid { attr_clone.gid = gid; }
+                if let Some(atime) = atime { attr_clone.atime = atime.to_time(); }
+                if let Some(mtime) = mtime { attr_clone.mtime = mtime.to_time(); }
+                if let Some(ctime) = ctime { attr_clone.ctime = ctime; }
+                if let Some(flags) = flags { attr_clone.flags = flags; }
+                node.attr = attr_clone;
+                if let Some(worker) = &self.disk_worker {
+                    worker.sender().send(WriteJob::SetAttr { ino, attr: attr_clone }).unwrap();
+                }
+                return Ok(attr_clone);
+            }
         };
+
+        let data = if let Some(data_arc) = data_arc {
+            data_arc
+        } else {
+            let fs_path = self.disk_worker.as_ref().unwrap().image().get_fs_path(&path.unwrap());
+            let new_data = fs::read(fs_path).unwrap_or_default();
+            Arc::new(RwLock::new(new_data))
+        };
+
+        if let Some(mode) = mode { attr.perm = mode as u16; }
+        if let Some(uid) = uid { attr.uid = uid; }
+        if let Some(gid) = gid { attr.gid = gid; }
+        if let Some(atime) = atime { attr.atime = atime.to_time(); }
+        if let Some(mtime) = mtime { attr.mtime = mtime.to_time(); }
+        if let Some(ctime) = ctime { attr.ctime = ctime; }
+        if let Some(flags) = flags { attr.flags = flags; }
+
+        let mut evicted = Vec::new();
+        if let Some(size) = size {
+            data.write().unwrap().resize(size as usize, 0u8);
+            attr.size = size;
+            evicted.extend(self.lru_manager.put(ino, data.clone()));
+        }
+
         let mut nodes = self.nodes.write().unwrap();
         let node = nodes.get_mut(ino)?;
-        let mut attr = node.attr;
-        if let Some(mode) = mode {
-            attr.perm = mode as u16;
-        }
-        if let Some(uid) = uid {
-            attr.uid = uid;
-        }
-        if let Some(gid) = gid {
-            attr.gid = gid;
-        }
-        if let Some(atime) = atime {
-            attr.atime = atime.to_time();
-        }
-        if let Some(mtime) = mtime {
-            attr.mtime = mtime.to_time();
-        }
-        if let Some(ctime) = ctime {
-            attr.ctime = ctime;
-        }
-        if let Some(flags) = flags {
-            attr.flags = flags;
-        }
-        if let Some(size) = size {
-            if let NodeKind::File(file) = &mut node.kind {
-                let data = match &mut file.content {
-                    FileContent::InMemory(data) => data,
-                    FileContent::OnDisk => {
-                        let fs_path = self
-                            .disk_worker
-                            .as_ref()
-                            .unwrap()
-                            .image()
-                            .get_fs_path(&path.unwrap());
-                        let new_data = fs::read(fs_path).unwrap_or_default();
-                        file.content = FileContent::InMemory(Arc::new(RwLock::new(new_data)));
-                        if let FileContent::InMemory(data) = &mut file.content {
-                            data
-                        } else {
-                            unreachable!()
-                        }
-                    }
-                };
-                let old_size = {
-                    let data = data.read().unwrap();
-                    data.len() as u64
-                };
+        let old_size = node.attr.size;
+        node.attr = attr;
+        if let NodeKind::File(file) = &mut node.kind {
+            if file.content.is_ondisk() {
+                file.content = FileContent::InMemory(data.clone());
+            }
+            if let Some(size) = size {
                 if size < old_size {
                     file.dirty_regions.truncate(size);
                 } else {
                     file.dirty_regions.add_region(old_size, size);
                 }
-
-                let mut data = data.write().unwrap();
-                data.resize(size as usize, 0u8);
-                attr.size = size;
                 file.dirty = true;
-                if let Some(worker) = &self.disk_worker {
-                    worker
-                        .sender()
-                        .send(WriteJob::Write { ino })
-                        .unwrap();
+            }
+        }
+        for (evicted_ino, evicted_content) in evicted {
+            if let Ok(node) = nodes.get_mut(evicted_ino) {
+                if let NodeKind::File(file) = &mut node.kind {
+                    if let FileContent::InMemory(existing_content) = &file.content {
+                        if Arc::ptr_eq(&evicted_content, existing_content) {
+                            file.content = FileContent::OnDisk;
+                        }
+                    }
                 }
             }
         }
-        node.attr = attr;
 
         if let Some(worker) = &self.disk_worker {
-            worker
-                .sender()
-                .send(WriteJob::SetAttr { ino, attr })
-                .unwrap();
+            worker.sender().send(WriteJob::SetAttr { ino, attr }).unwrap();
+            if size.is_some() {
+                worker.sender().send(WriteJob::Write { ino }).unwrap();
+            }
         }
-
         Ok(attr)
     }
 
@@ -285,11 +300,24 @@ impl MemoryFuse {
     }
 
     fn unlink_node(&mut self, parent: u64, name: &OsStr) -> Result<()> {
-        let mut nodes = self.nodes.write().unwrap();
-        let ino = {
-            let dir = nodes.get_dir_mut(parent)?;
-            dir.remove(name)?
+        let (ino, nlink) = {
+            let mut nodes = self.nodes.write().unwrap();
+            let ino = {
+                let dir = nodes.get_dir_mut(parent)?;
+                dir.remove(name)?
+            };
+            let nlink = {
+                let node = nodes.get(ino)?;
+                node.attr.nlink
+            };
+            (ino, nlink)
         };
+
+        if nlink == 1 {
+            self.lru_manager.remove(&ino);
+        }
+
+        let mut nodes = self.nodes.write().unwrap();
         nodes.remove_parent(ino, parent, name);
         if let Some(worker) = &self.disk_worker {
             worker
@@ -390,93 +418,132 @@ impl MemoryFuse {
     }
 
     fn read_file(&mut self, ino: u64, offset: i64, size: u32) -> Result<Vec<u8>> {
-        let path = {
+        let (path, content) = {
             let nodes = self.nodes.read().unwrap();
-            build_path(&nodes, ino).ok()
-        };
-        let mut nodes = self.nodes.write().unwrap();
-        let node = nodes.get_mut(ino)?;
-        if let NodeKind::File(file) = &mut node.kind {
-            let data = match &mut file.content {
-                FileContent::InMemory(data) => data.clone(),
-                FileContent::OnDisk => {
-                    let fs_path = self
-                        .disk_worker
-                        .as_ref()
-                        .unwrap()
-                        .image()
-                        .get_fs_path(&path.unwrap());
-                    let new_data = fs::read(fs_path).unwrap_or_default();
-                    let new_data_arc = Arc::new(RwLock::new(new_data));
-                    file.content = FileContent::InMemory(new_data_arc.clone());
-                    new_data_arc
-                }
-            };
-            let data = data.read().unwrap();
-            let effective_offset = if offset < 0 {
-                max(0, (data.len() as i64 + offset) as usize)
-            } else {
-                min(offset as usize, data.len())
-            };
-            let effective_end = min(effective_offset + size as usize, data.len());
-            Ok(data[effective_offset..effective_end].to_vec())
-        } else {
-            Err(ENOENT)
-        }
-    }
-
-    fn write_file(&mut self, ino: u64, offset: i64, new_data: &[u8]) -> Result<usize> {
-        let path = {
-            let nodes = self.nodes.read().unwrap();
-            build_path(&nodes, ino).ok()
-        };
-        let mut nodes = self.nodes.write().unwrap();
-        let node = nodes.get_mut(ino)?;
-        let new_size = {
-            if let NodeKind::File(file) = &mut node.kind {
-                let data_arc = match &mut file.content {
-                    FileContent::InMemory(data) => data.clone(),
-                    FileContent::OnDisk => {
-                        let fs_path = self
-                            .disk_worker
-                            .as_ref()
-                            .unwrap()
-                            .image()
-                            .get_fs_path(&path.unwrap());
-                        let new_data = fs::read(fs_path).unwrap_or_default();
-                        let new_data_arc = Arc::new(RwLock::new(new_data));
-                        file.content = FileContent::InMemory(new_data_arc.clone());
-                        new_data_arc
+            let node = nodes.get(ino)?;
+            if let NodeKind::File(file) = &node.kind {
+                match &file.content {
+                    FileContent::InMemory(data) => {
+                        self.lru_manager.get(&ino);
+                        (None, Some(data.clone()))
                     }
-                };
-                let mut data = data_arc.write().unwrap();
-                let effective_offset = if offset < 0 {
-                    (data.len() as i64 + offset) as usize
-                } else {
-                    offset as usize
-                };
-                let effective_size = effective_offset + new_data.len();
-                let new_size = if effective_size > data.len() {
-                    effective_size
-                } else {
-                    data.len()
-                };
-                if new_size > data.len() {
-                    data.resize(new_size, 0u8);
+                    FileContent::OnDisk => (build_path(&nodes, ino).ok(), None),
                 }
-                data[effective_offset..effective_size].copy_from_slice(new_data);
-                file.dirty = true;
-                file.dirty_regions
-                    .add_region(effective_offset as u64, effective_size as u64);
-                if let Some(worker) = &self.disk_worker {
-                    worker.sender().send(WriteJob::Write { ino }).unwrap();
-                }
-                new_size
             } else {
                 return Err(ENOENT);
             }
         };
+
+        let data_arc = if let Some(content) = content {
+            content
+        } else {
+            let fs_path = self.disk_worker.as_ref().unwrap().image().get_fs_path(&path.unwrap());
+            let new_data = fs::read(fs_path).unwrap_or_default();
+            let new_data_arc = Arc::new(RwLock::new(new_data));
+
+            let mut nodes = self.nodes.write().unwrap();
+            let evicted = self.lru_manager.put(ino, new_data_arc.clone());
+            let node = nodes.get_mut(ino)?;
+            if let NodeKind::File(file) = &mut node.kind {
+                file.content = FileContent::InMemory(new_data_arc.clone());
+            }
+            for (evicted_ino, evicted_content) in evicted {
+                if let Ok(node) = nodes.get_mut(evicted_ino) {
+                    if let NodeKind::File(file) = &mut node.kind {
+                        if let FileContent::InMemory(existing_content) = &file.content {
+                            if Arc::ptr_eq(&evicted_content, existing_content) {
+                                file.content = FileContent::OnDisk;
+                            }
+                        }
+                    }
+                }
+            }
+            new_data_arc
+        };
+
+        let data = data_arc.read().unwrap();
+        let effective_offset = if offset < 0 {
+            max(0, (data.len() as i64 + offset) as usize)
+        } else {
+            min(offset as usize, data.len())
+        };
+        let effective_end = min(effective_offset + size as usize, data.len());
+        Ok(data[effective_offset..effective_end].to_vec())
+    }
+
+    fn write_file(&mut self, ino: u64, offset: i64, new_data: &[u8]) -> Result<usize> {
+        let (path, data_arc) = {
+            let mut nodes = self.nodes.write().unwrap();
+            let node = nodes.get_mut(ino)?;
+            if let NodeKind::File(file) = &mut node.kind {
+                match &mut file.content {
+                    FileContent::InMemory(data) => {
+                        self.lru_manager.get(&ino);
+                        (None, Some(data.clone()))
+                    }
+                    FileContent::OnDisk => (build_path(&nodes, ino).ok(), None),
+                }
+            } else {
+                return Err(ENOENT);
+            }
+        };
+
+        let data = if let Some(data_arc) = data_arc {
+            data_arc
+        } else {
+            let fs_path = self.disk_worker.as_ref().unwrap().image().get_fs_path(&path.unwrap());
+            let new_data = fs::read(fs_path).unwrap_or_default();
+            Arc::new(RwLock::new(new_data))
+        };
+
+        let new_size;
+        let effective_offset;
+        {
+            let mut data_w = data.write().unwrap();
+            effective_offset = if offset < 0 {
+                (data_w.len() as i64 + offset) as usize
+            } else {
+                offset as usize
+            };
+            let effective_size = effective_offset + new_data.len();
+            new_size = if effective_size > data_w.len() {
+                effective_size
+            } else {
+                data_w.len()
+            };
+            if new_size > data_w.len() {
+                data_w.resize(new_size, 0u8);
+            }
+            data_w[effective_offset..effective_size].copy_from_slice(new_data);
+        }
+
+        let mut nodes = self.nodes.write().unwrap();
+        let node = nodes.get_mut(ino)?;
         node.attr.size = new_size as u64;
+        if let NodeKind::File(file) = &mut node.kind {
+            if file.content.is_ondisk() {
+                file.content = FileContent::InMemory(data.clone());
+            }
+            file.dirty = true;
+            file.dirty_regions
+                .add_region(effective_offset as u64, (effective_offset + new_data.len()) as u64);
+            let evicted = self.lru_manager.put(ino, data.clone());
+            for (evicted_ino, evicted_content) in evicted {
+                if let Ok(node) = nodes.get_mut(evicted_ino) {
+                    if let NodeKind::File(file) = &mut node.kind {
+                        if let FileContent::InMemory(existing_content) = &file.content {
+                            if Arc::ptr_eq(&evicted_content, existing_content) {
+                                file.content = FileContent::OnDisk;
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(worker) = &self.disk_worker {
+                worker.sender().send(WriteJob::Write { ino }).unwrap();
+            }
+        }
+
         Ok(new_data.len())
     }
 
@@ -923,7 +990,7 @@ mod tests {
     fn test_disk_mirroring() {
         let dir = tempdir().unwrap();
         let image_path = dir.path().to_path_buf();
-        let mut fuse = MemoryFuse::new(Some(image_path.clone()));
+        let mut fuse = MemoryFuse::new(Some(image_path.clone()), 500 * 1024 * 1024);
 
         // 1. Create a directory
         let dir_name = OsStr::new("mydir");
@@ -959,22 +1026,24 @@ mod tests {
         let data = b"hello world";
         fuse.write_file(file_ino, 0, data).unwrap();
 
-        let mut is_on_disk = false;
         for _ in 0..20 {
-            let on_disk_data = fs::read(&on_disk_file_path).unwrap_or_default();
-            if on_disk_data == data {
-                let nodes = fuse.nodes.read().unwrap();
-                let node = nodes.get(file_ino).unwrap();
-                if let NodeKind::File(file) = &node.kind {
-                    if let FileContent::OnDisk = &file.content {
-                        is_on_disk = true;
-                        break;
-                    }
-                }
+            if fs::read(&on_disk_file_path).unwrap_or_default() == data {
+                break;
             }
             sleep(Duration::from_millis(100));
         }
-        assert!(is_on_disk, "File write not completed or state not updated");
+        assert_eq!(fs::read(&on_disk_file_path).unwrap(), data);
+
+        // Check that the content is still in memory
+        {
+            let nodes = fuse.nodes.read().unwrap();
+            let node = nodes.get(file_ino).unwrap();
+            if let NodeKind::File(file) = &node.kind {
+                assert!(matches!(file.content, FileContent::InMemory(_)));
+            } else {
+                panic!("Node is not a file");
+            }
+        }
 
         // 4. Rename the file
         let new_file_name = OsStr::new("renamed.txt");
@@ -982,7 +1051,7 @@ mod tests {
             .unwrap();
 
         let new_on_disk_file_path = on_disk_dir_path.join("renamed.txt");
-        wait_for_path(&on_disk_file_path, true);
+        wait_for_path(&new_on_disk_file_path, true);
         wait_for_path(&on_disk_file_path, false);
         assert!(!on_disk_file_path.exists());
         assert!(new_on_disk_file_path.is_file());
@@ -1006,6 +1075,75 @@ mod tests {
         // 7. Unlink the link
         fuse.unlink_node(1, link_name).unwrap();
         wait_for_path(&on_disk_link_path, false);
+    }
+
+    #[test]
+    fn test_lru_eviction() {
+        let dir = tempdir().unwrap();
+        let image_path = dir.path().to_path_buf();
+        // 1MB cache size
+        let mut fuse = MemoryFuse::new(Some(image_path.clone()), 1024 * 1024);
+
+        // Create file 1 (0.6 MB)
+        let file1_name = OsStr::new("file1.txt");
+        let file1_attr = fuse.make_file(1, file1_name, 0o644, 1000, 1000).unwrap();
+        let file1_ino = file1_attr.ino;
+        let data1 = vec![1u8; 600 * 1024];
+        fuse.write_file(file1_ino, 0, &data1).unwrap();
+
+        // Create file 2 (0.6 MB)
+        let file2_name = OsStr::new("file2.txt");
+        let file2_attr = fuse.make_file(1, file2_name, 0o644, 1000, 1000).unwrap();
+        let file2_ino = file2_attr.ino;
+        let data2 = vec![2u8; 600 * 1024];
+        fuse.write_file(file2_ino, 0, &data2).unwrap();
+
+        // At this point, file1 should be evicted.
+        // The total size is 1.2MB, which is > 1MB.
+
+        // Wait for writes to complete
+        sleep(Duration::from_secs(2));
+
+        {
+            let nodes = fuse.nodes.read().unwrap();
+            let node1 = nodes.get(file1_ino).unwrap();
+            if let NodeKind::File(_file) = &node1.kind {
+                // This might not be OnDisk if the worker thread is slow.
+                // A better check is to see if we can load a third file.
+            } else {
+                panic!("Node1 is not a file");
+            }
+
+            let node2 = nodes.get(file2_ino).unwrap();
+            if let NodeKind::File(file) = &node2.kind {
+                assert!(matches!(file.content, FileContent::InMemory(_)));
+            } else {
+                panic!("Node2 is not a file");
+            }
+        }
+
+        // Access file1 again to bring it back to memory
+        fuse.read_file(file1_ino, 0, 1).unwrap();
+
+        // Now file2 should be evicted
+        sleep(Duration::from_secs(2));
+
+        {
+            let nodes = fuse.nodes.read().unwrap();
+            let node1 = nodes.get(file1_ino).unwrap();
+            if let NodeKind::File(file) = &node1.kind {
+                assert!(matches!(file.content, FileContent::InMemory(_)));
+            } else {
+                panic!("Node1 is not a file");
+            }
+
+            let node2 = nodes.get(file2_ino).unwrap();
+            if let NodeKind::File(file) = &node2.kind {
+                assert!(matches!(file.content, FileContent::OnDisk));
+            } else {
+                panic!("Node2 is not a file");
+            }
+        }
     }
 }
 

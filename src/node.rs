@@ -58,6 +58,12 @@ pub enum FileContent {
     OnDisk,
 }
 
+impl FileContent {
+    pub fn is_ondisk(&self) -> bool {
+        matches!(self, FileContent::OnDisk)
+    }
+}
+
 pub struct File {
     pub content: FileContent,
     pub dirty: bool,

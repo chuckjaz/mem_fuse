@@ -226,19 +226,6 @@ impl DiskImageWorker {
                         }
                     }
 
-                    // Now re-acquire lock to update state
-                    let mut nodes = nodes.write().unwrap();
-                    if let Ok(node) = nodes.get_mut(ino) {
-                        if let NodeKind::File(file) = &mut node.kind {
-                            if !file.dirty {
-                                if let FileContent::InMemory(current_data) = &file.content {
-                                    if Arc::ptr_eq(&data, current_data) {
-                                        file.content = FileContent::OnDisk;
-                                    }
-                                }
-                            }
-                        }
-                    }
                 }
             }
             WriteJob::SetAttr { ino, attr } => {
