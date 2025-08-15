@@ -10,7 +10,7 @@ use log::{debug, info};
 use users::{get_current_gid, get_current_uid};
 
 use crate::lru_cache::LruManager;
-use crate::mirror::{build_path, LocalMirror, Mirror, MirrorWorker, WriteJob};
+use crate::mirror::{build_path, Mirror, MirrorWorker, WriteJob};
 use crate::node::{DirectoryKind, FileContent, Node, NodeKind, Nodes};
 use std::os::unix::fs::MetadataExt;
 
@@ -1124,6 +1124,7 @@ mod tests {
     use std::thread::sleep;
     use std::time::Duration;
     use tempfile::tempdir;
+    use crate::mirror::LocalMirror;
 
     fn wait_for_path(path: &Path, should_exist: bool) {
         for _ in 0..30 {
