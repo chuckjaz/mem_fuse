@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct DirtyRegions {
     regions: BTreeSet<(u64, u64)>,
 }

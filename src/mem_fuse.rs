@@ -10,7 +10,7 @@ use log::{debug, info};
 use users::{get_current_gid, get_current_uid};
 
 use crate::lru_cache::LruManager;
-use crate::mirror::{build_path, Mirror, MirrorWorker, WriteJob};
+use crate::mirror::{Mirror, MirrorWorker, PathResolver, WriteJob};
 use crate::node::{DirectoryKind, FileContent, Node, NodeKind, Nodes};
 use std::os::unix::fs::MetadataExt;
 
@@ -42,13 +42,13 @@ impl MemoryFuse {
                 let root = Node::new_directory(root_attr);
                 let _ = nodes.insert(root);
 
-                let mut new_entries = Vec::new();
-                for entry in mirror.read_dir(Path::new("")).unwrap() {
-                    new_entries.push(entry);
-                }
+                let new_entries = {
+                    let nodes_arc = Arc::new(RwLock::new(nodes.clone()));
+                    let path_resolver = PathResolver::new(&nodes_arc);
+                    mirror.read_dir(1, &path_resolver).unwrap()
+                };
 
                 for entry in new_entries {
-                    let path = entry.path();
                     let metadata = entry.metadata().unwrap();
                     let file_type = metadata.file_type();
 
@@ -77,7 +77,9 @@ impl MemoryFuse {
                     } else if kind == fuser::FileType::RegularFile {
                         Node::new_file_on_disk(attr)
                     } else {
-                        let target = mirror.read_link(&path).unwrap();
+                        let nodes_arc = Arc::new(RwLock::new(nodes.clone()));
+                        let path_resolver = PathResolver::new(&nodes_arc);
+                        let target = mirror.read_link(attr.ino, &path_resolver).unwrap();
                         Node::new_symbolic_link(attr, &target)
                     };
                     let root_node = nodes.get_mut(1).unwrap();
@@ -152,20 +154,16 @@ impl MemoryFuse {
                 return Ok(());
             }
         }
-        let path = {
-            let nodes = self.nodes.read().unwrap();
-            build_path(&nodes, ino)?
-        };
-
         if let Some(mirror) = self.mirror.clone() {
-            let mut new_dir = crate::node::Directory::new();
-            let mut new_nodes = Vec::new();
+            let entries = {
+                let path_resolver = PathResolver::new(&self.nodes);
+                mirror.read_dir(ino, &path_resolver).unwrap()
+            };
 
-            for entry in mirror.read_dir(&path).unwrap() {
-                let path = entry.path();
+            let mut new_nodes_data = Vec::new();
+            for entry in entries {
                 let metadata = entry.metadata().unwrap();
                 let file_type = metadata.file_type();
-
                 let kind = if file_type.is_dir() {
                     fuser::FileType::Directory
                 } else if file_type.is_file() {
@@ -175,7 +173,12 @@ impl MemoryFuse {
                 } else {
                     continue;
                 };
+                new_nodes_data.push((entry.file_name(), metadata, kind));
+            }
 
+            let mut new_nodes = Vec::new();
+            let mut new_dir = crate::node::Directory::new();
+            for (name, metadata, kind) in new_nodes_data {
                 let attr = self.create_attr(
                     kind,
                     (metadata.mode() & 0o777) as u16,
@@ -183,17 +186,17 @@ impl MemoryFuse {
                     metadata.gid(),
                     Some(metadata.len()),
                 );
-
                 let new_node = if kind == fuser::FileType::Directory {
                     Node::new_directory_on_disk(attr)
                 } else if kind == fuser::FileType::RegularFile {
                     Node::new_file_on_disk(attr)
                 } else {
-                    let target = mirror.read_link(&path).unwrap();
+                    let path_resolver = PathResolver::new(&self.nodes);
+                    let target = mirror.read_link(attr.ino, &path_resolver).unwrap();
                     Node::new_symbolic_link(attr, &target)
                 };
-                new_dir.insert(entry.file_name().as_os_str(), attr.ino)?;
-                new_nodes.push((new_node, entry.file_name().as_os_str().to_owned()));
+                new_dir.insert(&name, attr.ino)?;
+                new_nodes.push((new_node, name));
             }
 
             let mut nodes = self.nodes.write().unwrap();
@@ -222,19 +225,19 @@ impl MemoryFuse {
         ctime: Option<SystemTime>,
         flags: Option<u32>,
     ) -> Result<FileAttr> {
-        let (path, data_arc, mut attr) = {
+        let (data_arc, mut attr) = {
             let mut nodes = self.nodes.write().unwrap();
             let node = nodes.get_mut(ino)?;
             let mut attr_clone = node.attr;
             if let NodeKind::File(file) = &mut node.kind {
-                let (p, d) = match &mut file.content {
+                let d = match &mut file.content {
                     FileContent::InMemory(data) => {
                         self.lru_manager.get(&ino);
-                        (None, Some(data.clone()))
+                        Some(data.clone())
                     }
-                    FileContent::OnDisk => (build_path(&nodes, ino).ok(), None),
+                    FileContent::OnDisk => None,
                 };
-                (p, d, attr_clone)
+                (d, attr_clone)
             } else {
                 // Not a file, handle other attributes
                 if let Some(mode) = mode { attr_clone.perm = mode as u16; }
@@ -255,7 +258,13 @@ impl MemoryFuse {
         let data = if let Some(data_arc) = data_arc {
             data_arc
         } else {
-            let new_data = self.mirror.as_ref().unwrap().read_file(&path.unwrap()).unwrap_or_default();
+            let path_resolver = PathResolver::new(&self.nodes);
+            let new_data = self
+                .mirror
+                .as_ref()
+                .unwrap()
+                .read_file(ino, &path_resolver)
+                .unwrap_or_default();
             Arc::new(RwLock::new(new_data))
         };
 
@@ -570,16 +579,16 @@ impl MemoryFuse {
     }
 
     fn read_file(&mut self, ino: u64, offset: i64, size: u32) -> Result<Vec<u8>> {
-        let (path, content) = {
+        let content = {
             let nodes = self.nodes.read().unwrap();
             let node = nodes.get(ino)?;
             if let NodeKind::File(file) = &node.kind {
                 match &file.content {
                     FileContent::InMemory(data) => {
                         self.lru_manager.get(&ino);
-                        (None, Some(data.clone()))
+                        Some(data.clone())
                     }
-                    FileContent::OnDisk => (build_path(&nodes, ino).ok(), None),
+                    FileContent::OnDisk => None,
                 }
             } else {
                 return Err(ENOENT);
@@ -589,7 +598,13 @@ impl MemoryFuse {
         let data_arc = if let Some(content) = content {
             content
         } else {
-            let new_data = self.mirror.as_ref().unwrap().read_file(&path.unwrap()).unwrap_or_default();
+            let path_resolver = PathResolver::new(&self.nodes);
+            let new_data = self
+                .mirror
+                .as_ref()
+                .unwrap()
+                .read_file(ino, &path_resolver)
+                .unwrap_or_default();
             let new_data_arc = Arc::new(RwLock::new(new_data));
 
             let evicted = self.lru_manager.put(ino, new_data_arc.clone(), &self.nodes);
@@ -623,16 +638,16 @@ impl MemoryFuse {
     }
 
     fn write_file(&mut self, ino: u64, offset: i64, new_data: &[u8]) -> Result<usize> {
-        let (path, data_arc) = {
+        let data_arc = {
             let mut nodes = self.nodes.write().unwrap();
             let node = nodes.get_mut(ino)?;
             if let NodeKind::File(file) = &mut node.kind {
                 match &mut file.content {
                     FileContent::InMemory(data) => {
                         self.lru_manager.get(&ino);
-                        (None, Some(data.clone()))
+                        Some(data.clone())
                     }
-                    FileContent::OnDisk => (build_path(&nodes, ino).ok(), None),
+                    FileContent::OnDisk => None,
                 }
             } else {
                 return Err(ENOENT);
@@ -642,7 +657,13 @@ impl MemoryFuse {
         let data = if let Some(data_arc) = data_arc {
             data_arc
         } else {
-            let new_data = self.mirror.as_ref().unwrap().read_file(&path.unwrap()).unwrap_or_default();
+            let path_resolver = PathResolver::new(&self.nodes);
+            let new_data = self
+                .mirror
+                .as_ref()
+                .unwrap()
+                .read_file(ino, &path_resolver)
+                .unwrap_or_default();
             Arc::new(RwLock::new(new_data))
         };
 
