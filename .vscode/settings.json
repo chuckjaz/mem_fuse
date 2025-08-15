@@ -3,6 +3,7 @@
         "bkuptime",
         "blksize",
         "chgtime",
+        "Condvar",
         "crtime",
         "EEXIST",
         "ENOENT",

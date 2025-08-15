@@ -28,7 +28,7 @@ pub struct FuseCommand {
     /// The size of the lru cache in Mb
     #[arg(long, default_value_t = 500)]
     cache_size: u64,
-    /// Load files from the disk image lazily
+    /// Load files from the mirror lazily
     #[arg(long, default_value_t = false)]
     lazy_load: bool,
 }
