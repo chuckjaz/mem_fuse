@@ -129,7 +129,7 @@ impl MemoryFuse {
         if let Some(size) = size {
             data.write().unwrap().resize(size as usize, 0u8);
             attr.size = size;
-            evicted.extend(self.lru_manager.put(ino, data.clone()));
+            evicted.extend(self.lru_manager.put(ino, data.clone(), &self.nodes));
         }
 
         let mut nodes = self.nodes.write().unwrap();
@@ -441,8 +441,8 @@ impl MemoryFuse {
             let new_data = fs::read(fs_path).unwrap_or_default();
             let new_data_arc = Arc::new(RwLock::new(new_data));
 
+            let evicted = self.lru_manager.put(ino, new_data_arc.clone(), &self.nodes);
             let mut nodes = self.nodes.write().unwrap();
-            let evicted = self.lru_manager.put(ino, new_data_arc.clone());
             let node = nodes.get_mut(ino)?;
             if let NodeKind::File(file) = &mut node.kind {
                 file.content = FileContent::InMemory(new_data_arc.clone());
@@ -517,6 +517,8 @@ impl MemoryFuse {
             data_w[effective_offset..effective_size].copy_from_slice(new_data);
         }
 
+        let evicted = self.lru_manager.put(ino, data.clone(), &self.nodes);
+
         let mut nodes = self.nodes.write().unwrap();
         let node = nodes.get_mut(ino)?;
         node.attr.size = new_size as u64;
@@ -527,7 +529,6 @@ impl MemoryFuse {
             file.dirty = true;
             file.dirty_regions
                 .add_region(effective_offset as u64, (effective_offset + new_data.len()) as u64);
-            let evicted = self.lru_manager.put(ino, data.clone());
             for (evicted_ino, evicted_content) in evicted {
                 if let Ok(node) = nodes.get_mut(evicted_ino) {
                     if let NodeKind::File(file) = &mut node.kind {
@@ -1140,6 +1141,45 @@ mod tests {
             let node2 = nodes.get(file2_ino).unwrap();
             if let NodeKind::File(file) = &node2.kind {
                 assert!(matches!(file.content, FileContent::OnDisk));
+            } else {
+                panic!("Node2 is not a file");
+            }
+        }
+    }
+
+    #[test]
+    fn test_lru_eviction_dirty() {
+        // 1MB cache size, no disk worker
+        let mut fuse = MemoryFuse::new(None, 1024 * 1024);
+
+        // Create file 1 (0.6 MB)
+        let file1_name = OsStr::new("file1.txt");
+        let file1_attr = fuse.make_file(1, file1_name, 0o644, 1000, 1000).unwrap();
+        let file1_ino = file1_attr.ino;
+        let data1 = vec![1u8; 600 * 1024];
+        fuse.write_file(file1_ino, 0, &data1).unwrap();
+
+        // Create file 2 (0.6 MB)
+        let file2_name = OsStr::new("file2.txt");
+        let file2_attr = fuse.make_file(1, file2_name, 0o644, 1000, 1000).unwrap();
+        let file2_ino = file2_attr.ino;
+        let data2 = vec![2u8; 600 * 1024];
+        fuse.write_file(file2_ino, 0, &data2).unwrap();
+
+        // At this point, file1 is LRU, but dirty. So it should not be evicted.
+        // And file2 is also dirty. So nothing should be evicted.
+        {
+            let nodes = fuse.nodes.read().unwrap();
+            let node1 = nodes.get(file1_ino).unwrap();
+            if let NodeKind::File(file) = &node1.kind {
+                assert!(matches!(file.content, FileContent::InMemory(_)));
+            } else {
+                panic!("Node1 is not a file");
+            }
+
+            let node2 = nodes.get(file2_ino).unwrap();
+            if let NodeKind::File(file) = &node2.kind {
+                assert!(matches!(file.content, FileContent::InMemory(_)));
             } else {
                 panic!("Node2 is not a file");
             }
