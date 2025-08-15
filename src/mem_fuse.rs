@@ -12,7 +12,6 @@ use users::{get_current_gid, get_current_uid};
 use crate::lru_cache::LruManager;
 use crate::mirror::{Mirror, MirrorWorker, PathResolver, WriteJob};
 use crate::node::{DirectoryKind, FileContent, Node, NodeKind, Nodes};
-use std::os::unix::fs::MetadataExt;
 
 pub(crate) type Result<T> = std::result::Result<T, c_int>;
 
@@ -48,29 +47,13 @@ impl MemoryFuse {
                     mirror.read_dir(1, &path_resolver).unwrap()
                 };
 
+                let mut max_ino = 1;
                 for entry in new_entries {
-                    let metadata = entry.metadata().unwrap();
-                    let file_type = metadata.file_type();
-
-                    let kind = if file_type.is_dir() {
-                        fuser::FileType::Directory
-                    } else if file_type.is_file() {
-                        fuser::FileType::RegularFile
-                    } else if file_type.is_symlink() {
-                        fuser::FileType::Symlink
-                    } else {
-                        continue;
-                    };
-
-                    let ino = next_ino_atomic.fetch_add(1, Ordering::Relaxed) as u64;
-                    let attr = new_attr(
-                        ino,
-                        kind,
-                        (metadata.mode() & 0o777) as u16,
-                        metadata.uid(),
-                        metadata.gid(),
-                        Some(metadata.len()),
-                    );
+                    let attr = entry.attr;
+                    if attr.ino > max_ino {
+                        max_ino = attr.ino;
+                    }
+                    let kind = attr.kind;
 
                     let node = if kind == fuser::FileType::Directory {
                         Node::new_directory_on_disk(attr)
@@ -84,11 +67,11 @@ impl MemoryFuse {
                     };
                     let root_node = nodes.get_mut(1).unwrap();
                     let dir = root_node.get_dir_mut().unwrap();
-                    dir.insert(entry.file_name().as_os_str(), attr.ino)
-                        .unwrap();
-                    nodes.add_parent(attr.ino, 1, entry.file_name().as_os_str());
+                    dir.insert(entry.name.as_os_str(), attr.ino).unwrap();
+                    nodes.add_parent(attr.ino, 1, entry.name.as_os_str());
                     nodes.insert(node).unwrap();
                 }
+                next_ino_atomic.store((max_ino + 1) as usize, Ordering::Relaxed);
             }
         } else {
             let attr = new_attr(
@@ -162,30 +145,18 @@ impl MemoryFuse {
 
             let mut new_nodes_data = Vec::new();
             for entry in entries {
-                let metadata = entry.metadata().unwrap();
-                let file_type = metadata.file_type();
-                let kind = if file_type.is_dir() {
-                    fuser::FileType::Directory
-                } else if file_type.is_file() {
-                    fuser::FileType::RegularFile
-                } else if file_type.is_symlink() {
-                    fuser::FileType::Symlink
-                } else {
-                    continue;
-                };
-                new_nodes_data.push((entry.file_name(), metadata, kind));
+                let attr = entry.attr;
+                let kind = attr.kind;
+                new_nodes_data.push((entry.name, attr, kind));
             }
 
             let mut new_nodes = Vec::new();
             let mut new_dir = crate::node::Directory::new();
-            for (name, metadata, kind) in new_nodes_data {
-                let attr = self.create_attr(
-                    kind,
-                    (metadata.mode() & 0o777) as u16,
-                    metadata.uid(),
-                    metadata.gid(),
-                    Some(metadata.len()),
-                );
+            let mut max_ino = self.next_ino.load(Ordering::Relaxed) as u64;
+            for (name, attr, kind) in new_nodes_data {
+                if attr.ino > max_ino {
+                    max_ino = attr.ino;
+                }
                 let new_node = if kind == fuser::FileType::Directory {
                     Node::new_directory_on_disk(attr)
                 } else if kind == fuser::FileType::RegularFile {
@@ -198,6 +169,7 @@ impl MemoryFuse {
                 new_dir.insert(&name, attr.ino)?;
                 new_nodes.push((new_node, name));
             }
+            self.next_ino.store((max_ino + 1) as usize, Ordering::Relaxed);
 
             let mut nodes = self.nodes.write().unwrap();
             for (node, name) in new_nodes {
@@ -483,6 +455,7 @@ impl MemoryFuse {
             worker
                 .sender()
                 .send(WriteJob::Delete {
+                    ino,
                     parent,
                     name: name.to_owned(),
                 })
@@ -568,6 +541,7 @@ impl MemoryFuse {
             worker
                 .sender()
                 .send(WriteJob::Rename {
+                    ino: old_ino,
                     parent,
                     name: name.to_owned(),
                     new_parent: newparent,
