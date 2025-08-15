@@ -5,6 +5,7 @@ use std::error::Error;
 use std::{ffi::OsString, path::{Path, PathBuf}};
 use std::result::Result;
 mod disk_image;
+mod lru_cache;
 mod mem_fuse;
 mod node;
 mod dirty;
@@ -20,6 +21,9 @@ pub struct FuseCommand {
     /// The location to save the image to
     #[arg(short, long)]
     disk_image_path: Option<PathBuf>,
+    /// The size of the lru cache in Mb
+    #[arg(long, default_value_t = 500)]
+    cache_size: u64,
 }
 
 fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
@@ -30,13 +34,21 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
 
     info!("Starting FUSE: path: {path_text:?}");
     let path = Path::new(&path_text);
-    start_fuse(path, config.disk_image_path)?;
+    start_fuse(
+        path,
+        config.disk_image_path,
+        config.cache_size * 1024 * 1024,
+    )?;
 
     Ok(())
 }
 
-fn start_fuse(path: &Path, disk_image_path: Option<PathBuf>) -> Result<(), Box<dyn Error + Sync + Send>>{
-    let filesystem = mem_fuse::MemoryFuse::new(disk_image_path);
+fn start_fuse(
+    path: &Path,
+    disk_image_path: Option<PathBuf>,
+    cache_size: u64,
+) -> Result<(), Box<dyn Error + Sync + Send>> {
+    let filesystem = mem_fuse::MemoryFuse::new(disk_image_path, cache_size);
     fuser::mount2(filesystem, path, &[])?;
     Ok(())
 }
