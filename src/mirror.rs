@@ -61,16 +61,19 @@ impl<'a> PathResolver<'a> {
 #[derive(Debug)]
 pub enum WriteJob {
     CreateFile {
+        ino: u64,
         parent: u64,
         name: OsString,
         attr: FileAttr,
     },
     CreateDir {
+        ino: u64,
         parent: u64,
         name: OsString,
         attr: FileAttr,
     },
     CreateSymlink {
+        ino: u64,
         parent: u64,
         name: OsString,
         target: PathBuf,
@@ -135,19 +138,20 @@ impl MirrorWorker {
         debug!("Executing job: {job:?}");
         let path_resolver = PathResolver::new(nodes);
         match job {
-            WriteJob::CreateFile { parent, name, attr } => {
-                mirror.create_file(parent, &name, &attr, &path_resolver)?;
+            WriteJob::CreateFile { ino, parent, name, attr } => {
+                mirror.create_file(ino, parent, &name, &attr, &path_resolver)?;
             }
-            WriteJob::CreateDir { parent, name, attr } => {
-                mirror.create_dir(parent, &name, &attr, &path_resolver)?;
+            WriteJob::CreateDir { ino, parent, name, attr } => {
+                mirror.create_dir(ino, parent, &name, &attr, &path_resolver)?;
             }
             WriteJob::CreateSymlink {
+                ino,
                 parent,
                 name,
                 target,
                 attr,
             } => {
-                mirror.create_symlink(parent, &name, &target, &attr, &path_resolver)?;
+                mirror.create_symlink(ino, parent, &name, &target, &attr, &path_resolver)?;
             }
             WriteJob::Write { ino } => {
                 let (data_to_write, regions) = {
@@ -232,6 +236,7 @@ pub trait Mirror: Debug {
     fn read_file<'a>(&self, ino: u64, path_resolver: &PathResolver<'a>) -> std::io::Result<Vec<u8>>;
     fn create_file<'a>(
         &self,
+        ino: u64,
         parent: u64,
         name: &OsString,
         attr: &FileAttr,
@@ -239,6 +244,7 @@ pub trait Mirror: Debug {
     ) -> std::io::Result<()>;
     fn create_dir<'a>(
         &self,
+        ino: u64,
         parent: u64,
         name: &OsString,
         attr: &FileAttr,
@@ -246,6 +252,7 @@ pub trait Mirror: Debug {
     ) -> std::io::Result<()>;
     fn create_symlink<'a>(
         &self,
+        ino: u64,
         parent: u64,
         name: &OsString,
         target: &Path,
@@ -333,6 +340,7 @@ impl Mirror for LocalMirror {
 
     fn create_file<'a>(
         &self,
+        _ino: u64,
         parent: u64,
         name: &OsString,
         attr: &FileAttr,
@@ -351,6 +359,7 @@ impl Mirror for LocalMirror {
 
     fn create_dir<'a>(
         &self,
+        _ino: u64,
         parent: u64,
         name: &OsString,
         attr: &FileAttr,
@@ -366,6 +375,7 @@ impl Mirror for LocalMirror {
 
     fn create_symlink<'a>(
         &self,
+        _ino: u64,
         parent: u64,
         name: &OsString,
         target: &Path,
