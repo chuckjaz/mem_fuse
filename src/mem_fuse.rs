@@ -1,5 +1,5 @@
 use std::{
-    ffi::{OsStr, OsString}, os::unix::ffi::OsStrExt, path::Path, sync::{atomic::{AtomicUsize, Ordering}, Arc, RwLock, Condvar}, time::SystemTime, u32
+    collections::HashMap, ffi::{OsStr, OsString}, os::unix::ffi::OsStrExt, path::Path, sync::{atomic::{AtomicUsize, Ordering}, Arc, RwLock, Condvar}, time::SystemTime, u32
 };
 
 use fuser::{self, FileAttr, Filesystem, TimeOrNow};
@@ -152,24 +152,33 @@ impl MemoryFuse {
 
             let mut new_nodes = Vec::new();
             let mut new_dir = crate::node::Directory::new();
-            let mut max_ino = self.next_ino.load(Ordering::Relaxed) as u64;
-            for (name, attr, kind) in new_nodes_data {
-                if attr.ino > max_ino {
-                    max_ino = attr.ino;
+            let mut ino_map = HashMap::new();
+
+            for (name, mut attr, kind) in new_nodes_data {
+                let original_ino = attr.ino;
+                let new_ino = self.next_ino.fetch_add(1, Ordering::Relaxed) as u64;
+                attr.ino = new_ino;
+
+                if original_ino != 0 {
+                    ino_map.insert(new_ino, original_ino);
                 }
+
                 let new_node = if kind == fuser::FileType::Directory {
                     Node::new_directory_on_disk(attr)
                 } else if kind == fuser::FileType::RegularFile {
                     Node::new_file_on_disk(attr)
                 } else {
                     let path_resolver = PathResolver::new(&self.nodes);
-                    let target = mirror.read_link(attr.ino, &path_resolver).unwrap();
+                    let target = mirror.read_link(original_ino, &path_resolver).unwrap();
                     Node::new_symbolic_link(attr, &target)
                 };
                 new_dir.insert(&name, attr.ino)?;
                 new_nodes.push((new_node, name));
             }
-            self.next_ino.store((max_ino + 1) as usize, Ordering::Relaxed);
+
+            if !ino_map.is_empty() {
+                mirror.set_inode_map(&ino_map).unwrap();
+            }
 
             let mut nodes = self.nodes.write().unwrap();
             for (node, name) in new_nodes {

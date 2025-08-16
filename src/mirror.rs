@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     ffi::OsString,
     fmt::Debug,
     fs,
@@ -312,6 +313,10 @@ pub trait Mirror: Debug {
         new_name: &OsString,
         path_resolver: &PathResolver<'a>,
     ) -> std::io::Result<()>;
+
+    fn set_inode_map(&self, _ino_map: &HashMap<u64, u64>) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]

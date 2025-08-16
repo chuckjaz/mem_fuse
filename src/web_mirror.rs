@@ -202,7 +202,8 @@ impl Mirror for WebMirror {
         ino: u64,
         _path_resolver: &PathResolver<'a>,
     ) -> std::io::Result<Vec<MirrorDirEntry>> {
-        let url = self.get_url(&format!("files/directory/{ino}"));
+        let remote_ino = self.get_remote_ino(ino);
+        let url = self.get_url(&format!("files/directory/{remote_ino}"));
         let response = self.client.get(url).send().map_err(to_io_error)?;
         if !response.status().is_success() {
             return Err(io::Error::new(
@@ -225,7 +226,8 @@ impl Mirror for WebMirror {
     }
 
     fn read_link<'a>(&self, ino: u64, _path_resolver: &PathResolver<'a>) -> std::io::Result<PathBuf> {
-        let url = self.get_url(&format!("files/info/{ino}"));
+        let remote_ino = self.get_remote_ino(ino);
+        let url = self.get_url(&format!("files/info/{remote_ino}"));
         let response = self.client.get(url).send().map_err(to_io_error)?;
         if !response.status().is_success() {
             return Err(io::Error::new(
@@ -245,7 +247,8 @@ impl Mirror for WebMirror {
     }
 
     fn read_file<'a>(&self, ino: u64, _path_resolver: &PathResolver<'a>) -> std::io::Result<Vec<u8>> {
-        let url = self.get_url(&format!("files/{ino}"));
+        let remote_ino = self.get_remote_ino(ino);
+        let url = self.get_url(&format!("files/{remote_ino}"));
         let response = self.client.get(url).send().map_err(to_io_error)?;
         if !response.status().is_success() {
             return Err(io::Error::new(
@@ -494,6 +497,14 @@ impl Mirror for WebMirror {
                 ErrorKind::Other,
                 format!("Failed to link entry: {}", response.status()),
             ));
+        }
+        Ok(())
+    }
+
+    fn set_inode_map(&self, ino_map: &HashMap<u64, u64>) -> std::io::Result<()> {
+        let mut own_map = self.ino_map.write().unwrap();
+        for (local_ino, remote_ino) in ino_map {
+            own_map.insert(*local_ino, *remote_ino);
         }
         Ok(())
     }
