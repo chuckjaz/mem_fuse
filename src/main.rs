@@ -12,7 +12,7 @@ mod node;
 mod dirty;
 mod mirror;
 mod mirror_factory;
-mod web_mirror;
+mod invariant_files_mirror;
 
 #[derive(Debug, Parser)]
 #[command(name = "mem_fuse")]

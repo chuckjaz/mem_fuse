@@ -165,13 +165,13 @@ pub struct EntryAttributes {
 }
 
 #[derive(Debug)]
-pub struct WebMirror {
+pub struct InvariantFilesMirror {
     base_url: Url,
     client: Client,
     ino_map: RwLock<HashMap<u64, u64>>, // local -> remote
 }
 
-impl WebMirror {
+impl InvariantFilesMirror {
     pub fn new(base_url: &str) -> Self {
         let mut ino_map = HashMap::new();
         ino_map.insert(1, 1);
@@ -191,7 +191,7 @@ impl WebMirror {
     }
 }
 
-impl Mirror for WebMirror {
+impl Mirror for InvariantFilesMirror {
     fn read_dir<'a>(
         &self,
         ino: u64,
