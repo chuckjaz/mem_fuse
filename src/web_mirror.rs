@@ -21,16 +21,9 @@ fn to_io_error(err: reqwest::Error) -> io::Error {
     io::Error::new(io::ErrorKind::Other, err)
 }
 
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "PascalCase")]
-pub enum ContentKind {
-    File,
-    Directory,
-    SymbolicLink,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(unused)]
 pub struct FileContentInformation {
     pub node: u64,
     pub modify_time: u64,
@@ -45,6 +38,7 @@ pub struct FileContentInformation {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(unused)]
 pub struct DirectoryContentInformation {
     pub node: u64,
     pub modify_time: u64,
@@ -57,6 +51,7 @@ pub struct DirectoryContentInformation {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(unused)]
 pub struct SymbolicLinkContentInformation {
     pub node: u64,
     pub modify_time: u64,

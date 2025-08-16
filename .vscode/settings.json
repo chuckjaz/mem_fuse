@@ -26,6 +26,7 @@
         "readlink",
         "releasedir",
         "removexattr",
+        "reqwest",
         "setattr",
         "setxattr",
         "statfs",
