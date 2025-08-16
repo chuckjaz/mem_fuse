@@ -2,10 +2,10 @@ use clap::Parser;
 use env_logger::Env;
 use log::info;
 use std::error::Error;
-use std::{ffi::OsString, path::Path, sync::Arc};
+use std::sync::Arc;
+use std::{ffi::OsString, path::Path};
 use std::result::Result;
 use mem_fuse::MemoryFuse;
-use mirror::Mirror;
 mod lru_cache;
 mod mem_fuse;
 mod node;
@@ -31,6 +31,9 @@ pub struct FuseCommand {
     /// Load files from the mirror lazily
     #[arg(long, default_value_t = false)]
     lazy_load: bool,
+    #[arg(short, long)]
+    /// The root node of the invariant files server, ignored otherwise
+    root: Option<u64>,
 }
 
 fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
@@ -46,11 +49,13 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
         config.mirror,
         config.cache_size * 1024 * 1024,
         config.lazy_load,
+        config.root,
     )?;
 
     Ok(())
 }
 
+use crate::mirror::Mirror;
 use crate::mirror_factory::create_mirror;
 
 fn start_fuse(
@@ -58,9 +63,10 @@ fn start_fuse(
     mirror: Option<String>,
     cache_size: u64,
     lazy_load: bool,
+    root: Option<u64>,
 ) -> Result<(), Box<dyn Error + Sync + Send>> {
     let mirror: Option<Arc<dyn Mirror + Send + Sync>> =
-        mirror.map(|mirror_str| create_mirror(&mirror_str));
+        mirror.map(|mirror_str| create_mirror(&mirror_str, root));
     let filesystem = MemoryFuse::new(mirror, cache_size, lazy_load);
     fuser::mount2(filesystem, path, &[])?;
     Ok(())

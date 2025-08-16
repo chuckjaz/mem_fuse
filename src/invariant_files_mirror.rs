@@ -1,8 +1,5 @@
 use std::{
-    ffi::OsString,
-    io::{self, ErrorKind},
-    path::{Path, PathBuf},
-    time::UNIX_EPOCH,
+    ffi::OsString, io::{self, ErrorKind}, path::{Path, PathBuf}, time::UNIX_EPOCH
 };
 
 use std::collections::HashMap;
@@ -10,7 +7,7 @@ use std::sync::RwLock;
 
 use fuser::{FileAttr, FileType};
 use log::error;
-use reqwest::blocking::Client;
+use reqwest::{blocking::Client};
 use serde::{Deserialize, Serialize};
 use url::{form_urlencoded, Url};
 
@@ -172,9 +169,9 @@ pub struct InvariantFilesMirror {
 }
 
 impl InvariantFilesMirror {
-    pub fn new(base_url: &str) -> Self {
+    pub fn new(base_url: &str, root: Option<u64>) -> Self {
         let mut ino_map = HashMap::new();
-        ino_map.insert(1, 1);
+        ino_map.insert(1, root.unwrap_or(1));
         Self {
             base_url: Url::parse(base_url).unwrap(),
             client: Client::new(),
