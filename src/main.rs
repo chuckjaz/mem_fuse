@@ -23,13 +23,12 @@ pub struct FuseCommand {
     /// The location to mount the directory
     path: OsString,
     /// The location of the mirror
-    #[arg(short, long)]
     mirror: Option<String>,
     /// The size of the lru cache in Mb
     #[arg(long, default_value_t = 500)]
     cache_size: u64,
     /// Load files from the mirror lazily
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = true)]
     lazy_load: bool,
     #[arg(short, long)]
     /// The root node of the invariant files server, ignored otherwise
