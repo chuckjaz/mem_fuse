@@ -1,5 +1,5 @@
 use std::{
-    ffi::OsString, io::{self, ErrorKind}, path::{Path, PathBuf}, time::UNIX_EPOCH
+    ffi::OsString, io::{self, ErrorKind}, path::{Path, PathBuf}, time::UNIX_EPOCH, u32
 };
 
 use std::collections::HashMap;
@@ -71,7 +71,7 @@ impl ContentInformation {
     pub fn to_file_attr(&self) -> FileAttr {
         let (kind, perms, size, node, mtime, ctime) = match self {
             ContentInformation::File(info) => {
-                let mut perms = 0o644;
+                let mut perms = 0o444;
                 if info.writable {
                     perms |= 0o200;
                 }
@@ -88,7 +88,7 @@ impl ContentInformation {
                 )
             }
             ContentInformation::Directory(info) => {
-                let mut perms = 0o755;
+                let mut perms = 0o555;
                 if info.writable {
                     perms |= 0o200;
                 }
@@ -121,15 +121,15 @@ impl ContentInformation {
             ino: node,
             size,
             blocks: (size + 511) / 512,
-            atime: UNIX_EPOCH, // Not provided by server
-            mtime: UNIX_EPOCH + std::time::Duration::from_secs(mtime),
-            ctime: UNIX_EPOCH + std::time::Duration::from_secs(ctime),
-            crtime: UNIX_EPOCH + std::time::Duration::from_secs(ctime),
+            atime: UNIX_EPOCH + std::time::Duration::from_millis(mtime),
+            mtime: UNIX_EPOCH + std::time::Duration::from_millis(mtime),
+            ctime: UNIX_EPOCH + std::time::Duration::from_millis(ctime),
+            crtime: UNIX_EPOCH + std::time::Duration::from_millis(ctime),
             kind,
             perm: perms,
             nlink: 1,
-            uid: 0, // Not provided by server
-            gid: 0, // Not provided by server
+            uid: u32::MAX, // Not provided by server
+            gid: u32::MAX, // Not provided by server
             rdev: 0,
             flags: 0,
             blksize: 512,
@@ -152,9 +152,9 @@ pub struct EntryAttributes {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub writable: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub modify_time: Option<u64>,
+    pub modify_time: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub create_time: Option<u64>,
+    pub create_time: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
@@ -398,9 +398,9 @@ impl Mirror for InvariantFilesMirror {
         entry_attributes.writable = Some((attr.perm & 0o200) != 0);
         entry_attributes.size = size;
         entry_attributes.modify_time =
-            Some(attr.mtime.duration_since(UNIX_EPOCH).unwrap().as_secs());
+            Some(attr.mtime.duration_since(UNIX_EPOCH).unwrap().as_millis());
         entry_attributes.create_time =
-            Some(attr.crtime.duration_since(UNIX_EPOCH).unwrap().as_secs());
+            Some(attr.crtime.duration_since(UNIX_EPOCH).unwrap().as_millis());
 
         let response = self
             .client

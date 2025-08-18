@@ -25,7 +25,7 @@ pub struct MemoryFuse {
 
 impl MemoryFuse {
     pub fn new(mirror: Option<Arc<dyn Mirror + Send + Sync>>, cache_size: u64, lazy_load: bool) -> MemoryFuse {
-        let mut nodes = Nodes::new();
+        let nodes_arc = Arc::new(RwLock::new(Nodes::new()));
 
         let next_ino_atomic = AtomicUsize::new(2);
         if lazy_load {
@@ -39,36 +39,30 @@ impl MemoryFuse {
                     None,
                 );
                 let root = Node::new_directory(root_attr);
-                let _ = nodes.insert(root);
-
+                {
+                    let mut nodes = nodes_arc.write().unwrap();
+                    let _ = nodes.insert(root);
+                }
                 let new_entries = {
-                    let nodes_arc = Arc::new(RwLock::new(nodes.clone()));
                     let path_resolver = PathResolver::new(&nodes_arc);
                     mirror.read_dir(1, &path_resolver).unwrap()
                 };
 
-                let (new_nodes, new_dir, _) = Self::_process_directory_entries(
+                let new_dir = Self::process_directory_entries(
                     mirror,
-                    &Arc::new(RwLock::new(nodes.clone())),
+                    1,
+                    &nodes_arc,
                     &next_ino_atomic,
                     new_entries,
-                    false, // Use remote inos
                 ).unwrap();
 
-                let mut max_ino = 1;
-                let root_node = nodes.get_mut(1).unwrap();
-                if let NodeKind::Directory(dir_kind) = &mut root_node.kind {
-                    *dir_kind = DirectoryKind::InMemory(new_dir);
-                }
-
-                for (node, name) in new_nodes {
-                    if node.attr.ino > max_ino {
-                        max_ino = node.attr.ino;
+                {
+                    let mut nodes = nodes_arc.write().unwrap();
+                    let root_node = nodes.get_mut(1).unwrap();
+                    if let NodeKind::Directory(dir_kind) = &mut root_node.kind {
+                        *dir_kind = DirectoryKind::InMemory(new_dir);
                     }
-                    nodes.add_parent(node.attr.ino, 1, &name);
-                    nodes.insert(node).unwrap();
                 }
-                next_ino_atomic.store((max_ino + 1) as usize, Ordering::Relaxed);
             }
         } else {
             let attr = new_attr(
@@ -80,19 +74,19 @@ impl MemoryFuse {
                 None,
             );
             let root = Node::new_directory(attr);
+            let mut nodes = nodes_arc.write().unwrap();
             let _ = nodes.insert(root);
         }
 
-        let nodes = Arc::new(RwLock::new(nodes));
 
         let cache_cond = Arc::new(Condvar::new());
         let lru_manager = Arc::new(LruManager::new(cache_size, cache_cond.clone()));
 
         let mirror_worker =
-            mirror.clone().map(|mirror| MirrorWorker::new(mirror, Arc::clone(&nodes)));
+            mirror.clone().map(|mirror| MirrorWorker::new(mirror, nodes_arc.clone()));
 
         Self {
-            nodes,
+            nodes: nodes_arc,
             next_ino: next_ino_atomic,
             mirror_worker,
             mirror,
@@ -122,14 +116,13 @@ impl MemoryFuse {
         Ok(node.attr)
     }
 
-    fn _process_directory_entries(
+    fn process_directory_entries(
         mirror: &Arc<dyn Mirror + Send + Sync>,
-        nodes_for_resolver: &Arc<RwLock<Nodes>>,
+        parent: u64,
+        nodes: &Arc<RwLock<Nodes>>,
         next_ino: &AtomicUsize,
         entries: Vec<MirrorDirEntry>,
-        generate_new_inos: bool,
-    ) -> Result<(Vec<(Node, OsString)>, crate::node::Directory, HashMap<u64, u64>)> {
-        let mut new_nodes = Vec::new();
+    ) -> Result<crate::node::Directory> {
         let mut new_dir = crate::node::Directory::new();
         let mut ino_map = HashMap::new();
 
@@ -137,31 +130,41 @@ impl MemoryFuse {
             let mut attr = entry.attr;
             let original_ino = attr.ino;
 
-            let new_ino = if generate_new_inos {
-                let ino = next_ino.fetch_add(1, Ordering::Relaxed) as u64;
-                attr.ino = ino;
-                if original_ino != 0 {
-                    ino_map.insert(ino, original_ino);
-                }
-                ino
-            } else {
-                original_ino
-            };
+            let ino = next_ino.fetch_add(1, Ordering::Relaxed) as u64;
+            attr.ino = ino;
+            if original_ino != 0 {
+                ino_map.insert(ino, original_ino);
+            }
+
+            // Fix the uid/gid if the mirror doesn't provide it.
+            if attr.uid == u32::MAX {
+                attr.uid = get_current_uid()
+            }
+            if attr.gid == u32::MAX {
+                attr.gid = get_current_gid();
+            }
 
             let new_node = if attr.kind == fuser::FileType::Directory {
                 Node::new_directory_on_disk(attr)
             } else if attr.kind == fuser::FileType::RegularFile {
                 Node::new_file_on_disk(attr)
             } else {
-                let path_resolver = PathResolver::new(nodes_for_resolver);
+                let path_resolver = PathResolver::new(nodes);
                 let target = mirror.read_link(original_ino, &path_resolver).unwrap();
                 Node::new_symbolic_link(attr, &target)
             };
-            new_dir.insert(&entry.name, new_ino)?;
-            new_nodes.push((new_node, entry.name));
+            {
+                let mut nodes = nodes.write().unwrap();
+                nodes.add_parent(new_node.attr.ino, parent, &entry.name);
+                nodes.insert(new_node).unwrap();
+            }
+            new_dir.insert(&entry.name, ino)?;
+        }
+        if !ino_map.is_empty() {
+            mirror.set_inode_map(&ino_map).unwrap();
         }
 
-        Ok((new_nodes, new_dir, ino_map))
+        Ok(new_dir)
     }
 
     fn load_directory(&mut self, ino: u64) -> Result<()> {
@@ -182,24 +185,15 @@ impl MemoryFuse {
                 mirror.read_dir(ino, &path_resolver).unwrap()
             };
 
-            let (new_nodes, new_dir, ino_map) = Self::_process_directory_entries(
+            let new_dir = Self::process_directory_entries(
                 &mirror,
+                ino,
                 &self.nodes,
                 &self.next_ino,
                 entries,
-                true, // Generate new inos
             )?;
 
-            if !ino_map.is_empty() {
-                mirror.set_inode_map(&ino_map).unwrap();
-            }
-
             let mut nodes = self.nodes.write().unwrap();
-            for (node, name) in new_nodes {
-                let attr = node.attr;
-                nodes.insert(node)?;
-                nodes.add_parent(attr.ino, ino, &name);
-            }
             let node = nodes.get_mut(ino)?;
             if let NodeKind::Directory(dir_kind) = &mut node.kind {
                 *dir_kind = DirectoryKind::InMemory(new_dir);
