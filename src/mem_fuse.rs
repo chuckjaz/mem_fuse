@@ -24,7 +24,12 @@ pub struct MemoryFuse {
 }
 
 impl MemoryFuse {
-    pub fn new(mirror: Option<Arc<dyn Mirror + Send + Sync>>, cache_size: u64, lazy_load: bool) -> MemoryFuse {
+    pub fn new(
+        mirror: Option<Arc<dyn Mirror + Send + Sync>>,
+        cache_size: u64,
+        cache_max_write_size: u64,
+        lazy_load: bool,
+    ) -> MemoryFuse {
         let nodes_arc = Arc::new(RwLock::new(Nodes::new()));
 
         let next_ino_atomic = AtomicUsize::new(2);
@@ -80,10 +85,14 @@ impl MemoryFuse {
 
 
         let cache_cond = Arc::new(Condvar::new());
-        let lru_manager = Arc::new(LruManager::new(cache_size, cache_cond.clone()));
+        let lru_manager = Arc::new(LruManager::new(
+            cache_size,
+            cache_max_write_size,
+            cache_cond.clone(),
+        ));
 
         let mirror_worker =
-            mirror.clone().map(|mirror| MirrorWorker::new(mirror, nodes_arc.clone()));
+            mirror.clone().map(|mirror| MirrorWorker::new(mirror, nodes_arc.clone(), cache_cond.clone()));
 
         Self {
             nodes: nodes_arc,
@@ -265,12 +274,14 @@ impl MemoryFuse {
         if let Some(ctime) = ctime { attr.ctime = ctime; }
         if let Some(flags) = flags { attr.flags = flags; }
 
-        let mut evicted = Vec::new();
-        if let Some(size) = size {
+        let evicted = if let Some(size) = size {
             data.write().unwrap().resize(size as usize, 0u8);
             attr.size = size;
-            evicted.extend(self.lru_manager.put(ino, data.clone(), &self.nodes));
-        }
+            self.lru_manager
+                .put(ino, data.clone(), &self.nodes, self.mirror.is_some())?
+        } else {
+            Vec::new()
+        };
 
         let mut nodes = self.nodes.write().unwrap();
         let node = nodes.get_mut(ino)?;
@@ -599,7 +610,12 @@ impl MemoryFuse {
                 .unwrap_or_default();
             let new_data_arc = Arc::new(RwLock::new(new_data));
 
-            let evicted = self.lru_manager.put(ino, new_data_arc.clone(), &self.nodes);
+            let evicted = self.lru_manager.put(
+                ino,
+                new_data_arc.clone(),
+                &self.nodes,
+                self.mirror.is_some(),
+            )?;
             let mut nodes = self.nodes.write().unwrap();
             let node = nodes.get_mut(ino)?;
             if let NodeKind::File(file) = &mut node.kind {
@@ -680,7 +696,12 @@ impl MemoryFuse {
             data_w[effective_offset..effective_size].copy_from_slice(new_data);
         }
 
-        let evicted = self.lru_manager.put(ino, data.clone(), &self.nodes);
+        let evicted = self.lru_manager.put(
+            ino,
+            data.clone(),
+            &self.nodes,
+            self.mirror.is_some(),
+        )?;
 
         let mut nodes = self.nodes.write().unwrap();
         let node = nodes.get_mut(ino)?;
@@ -1158,7 +1179,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let image_path = dir.path().to_path_buf();
         let mirror = LocalMirror::new(image_path.clone());
-        let mut fuse = MemoryFuse::new(Some(Arc::new(mirror)), 500 * 1024 * 1024, false);
+        let mut fuse = MemoryFuse::new(
+            Some(Arc::new(mirror)),
+            500 * 1024 * 1024,
+            500 * 1024 * 1024,
+            false,
+        );
 
         // 1. Create a directory
         let dir_name = OsStr::new("mydir");
@@ -1251,7 +1277,12 @@ mod tests {
         let image_path = dir.path().to_path_buf();
         let mirror = LocalMirror::new(image_path.clone());
         // 1MB cache size
-        let mut fuse = MemoryFuse::new(Some(Arc::new(mirror)), 1024 * 1024, false);
+        let mut fuse = MemoryFuse::new(
+            Some(Arc::new(mirror)),
+            1024 * 1024,
+            1024 * 1024,
+            false,
+        );
 
         // Create file 1 (0.6 MB)
         let file1_name = OsStr::new("file1.txt");
@@ -1318,7 +1349,7 @@ mod tests {
     #[test]
     fn test_lru_eviction_dirty() {
         // 1MB cache size, no disk worker
-        let mut fuse = MemoryFuse::new(None, 1024 * 1024, false);
+        let mut fuse = MemoryFuse::new(None, 1024 * 1024, 1024 * 1024, false);
 
         // Create file 1 (0.6 MB)
         let file1_name = OsStr::new("file1.txt");
@@ -1332,26 +1363,12 @@ mod tests {
         let file2_attr = fuse.make_file(1, file2_name, 0o644, 1000, 1000).unwrap();
         let file2_ino = file2_attr.ino;
         let data2 = vec![2u8; 600 * 1024];
-        fuse.write_file(file2_ino, 0, &data2).unwrap();
+        let result = fuse.write_file(file2_ino, 0, &data2);
 
-        // At this point, file1 is LRU, but dirty. So it should not be evicted.
-        // And file2 is also dirty. So nothing should be evicted.
-        {
-            let nodes = fuse.nodes.read().unwrap();
-            let node1 = nodes.get(file1_ino).unwrap();
-            if let NodeKind::File(file) = &node1.kind {
-                assert!(matches!(file.content, FileContent::InMemory(_)));
-            } else {
-                panic!("Node1 is not a file");
-            }
-
-            let node2 = nodes.get(file2_ino).unwrap();
-            if let NodeKind::File(file) = &node2.kind {
-                assert!(matches!(file.content, FileContent::InMemory(_)));
-            } else {
-                panic!("Node2 is not a file");
-            }
-        }
+        // At this point, the cache is full of dirty files and there's no mirror.
+        // The write should fail with ENOSPC.
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), libc::ENOSPC);
     }
 
     #[test]
@@ -1367,7 +1384,12 @@ mod tests {
 
         // 2. Start MemoryFuse with lazy loading enabled
         let mirror = LocalMirror::new(image_path.clone());
-        let mut fuse = MemoryFuse::new(Some(Arc::new(mirror)), 1024 * 1024, true);
+        let mut fuse = MemoryFuse::new(
+            Some(Arc::new(mirror)),
+            1024 * 1024,
+            1024 * 1024,
+            true,
+        );
 
         // 3. Verify that initially, only the root directory is loaded
         {
