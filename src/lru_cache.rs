@@ -43,6 +43,7 @@ impl LruManager {
             if has_mirror {
                 while data.current_size + content_len > self.max_write_size {
                     data = self.cache_cond.wait(data).unwrap();
+                    Self::evict_clean(&mut data, self.max_size, ino, nodes);
                 }
             } else {
                 // Before returning an error, try to evict some clean files to make space.
