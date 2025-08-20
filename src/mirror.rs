@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         mpsc::{self, Sender},
-        Arc, RwLock,
+        Arc, Condvar, RwLock,
     },
     thread::{self, JoinHandle},
 };
@@ -118,17 +118,19 @@ impl MirrorWorker {
     pub fn new(
         mirror: Arc<dyn Mirror + Send + Sync>,
         nodes: Arc<RwLock<Nodes>>,
+        cache_cond: Arc<Condvar>,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<WriteJob>();
 
         let worker_mirror = mirror;
         let worker_thread = thread::spawn(move || {
             for job in rx {
-                if let Err(e) = Self::handle_job(&worker_mirror, &nodes, job) {
+                if let Err(e) = Self::handle_job(&worker_mirror, &nodes, job, &cache_cond) {
                     debug!("Failed to execute write job: {e:?}");
                 }
             }
         });
+
 
         Self {
             work_queue: tx,
@@ -140,6 +142,7 @@ impl MirrorWorker {
         mirror: &Arc<dyn Mirror + Send + Sync>,
         nodes: &Arc<RwLock<Nodes>>,
         job: WriteJob,
+        cache_cond: &Arc<Condvar>,
     ) -> std::io::Result<()> {
         debug!("Executing job: {job:?}");
         let path_resolver = PathResolver::new(nodes);
@@ -195,6 +198,7 @@ impl MirrorWorker {
                         mirror.write(ino, &data[start..end], start as u64, &path_resolver)?;
                     }
                 }
+                cache_cond.notify_all();
             }
             WriteJob::SetAttr { ino, attr } => {
                 mirror.set_attr(ino, &attr, Some(attr.size), &path_resolver)?;

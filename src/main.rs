@@ -25,8 +25,11 @@ pub struct FuseCommand {
     /// The location of the mirror
     mirror: Option<String>,
     /// The size of the lru cache in Mb
-    #[arg(long, default_value_t = 500)]
+    #[arg(long, default_value_t = 1024)]
     cache_size: u64,
+    /// The maximum size of the cache for writes in Mb
+    #[arg(long, default_value_t = 1024)]
+    cache_max_write_size: u64,
     /// Load files from the mirror lazily
     #[arg(long, default_value_t = true)]
     lazy_load: bool,
@@ -47,6 +50,7 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
         path,
         config.mirror,
         config.cache_size * 1024 * 1024,
+        config.cache_max_write_size * 1024 * 1024,
         config.lazy_load,
         config.root,
     )?;
@@ -61,12 +65,13 @@ fn start_fuse(
     path: &Path,
     mirror: Option<String>,
     cache_size: u64,
+    cache_max_write_size: u64,
     lazy_load: bool,
     root: Option<u64>,
 ) -> Result<(), Box<dyn Error + Sync + Send>> {
     let mirror: Option<Arc<dyn Mirror + Send + Sync>> =
         mirror.map(|mirror_str| create_mirror(&mirror_str, root));
-    let filesystem = MemoryFuse::new(mirror, cache_size, lazy_load);
+    let filesystem = MemoryFuse::new(mirror, cache_size, cache_max_write_size, lazy_load);
     fuser::mount2(filesystem, path, &[])?;
     Ok(())
 }
