@@ -91,8 +91,9 @@ impl MemoryFuse {
             cache_cond.clone(),
         ));
 
-        let mirror_worker =
-            mirror.clone().map(|mirror| MirrorWorker::new(mirror, nodes_arc.clone(), cache_cond.clone()));
+        let mirror_worker = mirror.clone().map(|mirror| {
+            MirrorWorker::new(mirror, nodes_arc.clone(), lru_manager.clone(), cache_cond.clone())
+        });
 
         Self {
             nodes: nodes_arc,
@@ -278,7 +279,7 @@ impl MemoryFuse {
             data.write().unwrap().resize(size as usize, 0u8);
             attr.size = size;
             self.lru_manager
-                .put(ino, data.clone(), &self.nodes, self.mirror.is_some())?
+                .put(ino, data.clone(), self.mirror.is_some(), true)?
         } else {
             Vec::new()
         };
@@ -613,8 +614,8 @@ impl MemoryFuse {
             let evicted = self.lru_manager.put(
                 ino,
                 new_data_arc.clone(),
-                &self.nodes,
                 self.mirror.is_some(),
+                false,
             )?;
             let mut nodes = self.nodes.write().unwrap();
             let node = nodes.get_mut(ino)?;
@@ -699,8 +700,8 @@ impl MemoryFuse {
         let evicted = self.lru_manager.put(
             ino,
             data.clone(),
-            &self.nodes,
             self.mirror.is_some(),
+            true,
         )?;
 
         let mut nodes = self.nodes.write().unwrap();
