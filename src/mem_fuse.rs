@@ -1433,6 +1433,68 @@ mod tests {
         let data = fuse.read_file(file_attr.ino, 0, 1024).unwrap();
         assert_eq!(data, b"hello");
     }
+
+    #[test]
+    fn test_shutdown_flushes_writes() {
+        let dir = tempdir().unwrap();
+        let image_path = dir.path().to_path_buf();
+        let mirror = LocalMirror::new(image_path.clone());
+        let mut fuse = MemoryFuse::new(
+            Some(Arc::new(mirror)),
+            500 * 1024 * 1024,
+            500 * 1024 * 1024,
+            false,
+        );
+
+        // 1. Create a file
+        let file_name = OsStr::new("test.txt");
+        let file_attr = fuse
+            .make_file(1, file_name, 0o644, 1000, 1000)
+            .unwrap();
+        let file_ino = file_attr.ino;
+
+        // 2. Write to the file
+        let data = b"hello shutdown";
+        fuse.write_file(file_ino, 0, data).unwrap();
+
+        // 3. Stop the mirror worker, which should trigger a flush.
+        fuse.mirror_worker.take().unwrap().stop();
+
+        // 4. Verify that the file was written to the mirror
+        let on_disk_file_path = image_path.join("test.txt");
+        wait_for_path(&on_disk_file_path, true);
+        assert_eq!(fs::read(&on_disk_file_path).unwrap(), data);
+    }
+
+    #[test]
+    fn test_shutdown_flushes_dirty_files() {
+        let dir = tempdir().unwrap();
+        let image_path = dir.path().to_path_buf();
+        let mirror = LocalMirror::new(image_path.clone());
+        let mut fuse = MemoryFuse::new(
+            Some(Arc::new(mirror)),
+            500 * 1024 * 1024,
+            500 * 1024 * 1024,
+            false,
+        );
+
+        // 1. Create a file and write to it to make it dirty
+        let file_name = OsStr::new("dirty_file.txt");
+        let file_attr = fuse
+            .make_file(1, file_name, 0o644, 1000, 1000)
+            .unwrap();
+        let file_ino = file_attr.ino;
+        let data = b"this file is dirty";
+        fuse.write_file(file_ino, 0, data).unwrap();
+
+        // 2. Stop the mirror worker, which should trigger a flush of dirty files.
+        fuse.mirror_worker.take().unwrap().stop();
+
+        // 3. Verify that the file was written to the mirror
+        let on_disk_file_path = image_path.join("dirty_file.txt");
+        wait_for_path(&on_disk_file_path, true);
+        assert_eq!(fs::read(&on_disk_file_path).unwrap(), data);
+    }
 }
 
 const MEM_TTL: std::time::Duration = std::time::Duration::from_secs(30);
