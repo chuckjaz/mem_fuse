@@ -107,6 +107,7 @@ pub enum WriteJob {
         new_parent: u64,
         new_name: OsString,
     },
+    Shutdown,
 }
 
 pub struct MirrorWorker {
@@ -126,6 +127,9 @@ impl MirrorWorker {
         let worker_mirror = mirror;
         let worker_thread = thread::spawn(move || {
             for job in rx {
+                if matches!(job, WriteJob::Shutdown) {
+                    break;
+                }
                 if let Err(e) = Self::handle_job(&worker_mirror, &nodes, &lru_manager, job, &cache_cond) {
                     debug!("Failed to execute write job: {e:?}");
                 }
@@ -225,6 +229,7 @@ impl MirrorWorker {
             } => {
                 mirror.link(ino, new_parent, &new_name, &path_resolver)?;
             }
+            WriteJob::Shutdown => {}
         }
         Ok(())
     }
@@ -235,9 +240,7 @@ impl MirrorWorker {
     }
 
     pub fn stop(mut self) {
-        // By taking ownership of self, the work_queue sender is dropped when
-        // this function returns, which will cause the worker thread to exit.
-        drop(self.work_queue);
+        self.work_queue.send(WriteJob::Shutdown).unwrap();
         if let Some(worker_thread) = self.worker_thread.take() {
             worker_thread.join().unwrap();
         }
