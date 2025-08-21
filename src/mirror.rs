@@ -18,7 +18,7 @@ use std::time::SystemTime;
 use fuser::{FileAttr, FileType};
 use libc::{c_int, ENOENT};
 use log::{debug, info};
-use crate::node::{FileContent, NodeKind, Nodes};
+use crate::{lru_cache::LruManager, node::{FileContent, NodeKind, Nodes}};
 
 pub(crate) type Result<T> = std::result::Result<T, c_int>;
 
@@ -118,6 +118,7 @@ impl MirrorWorker {
     pub fn new(
         mirror: Arc<dyn Mirror + Send + Sync>,
         nodes: Arc<RwLock<Nodes>>,
+        lru_manager: Arc<LruManager>,
         cache_cond: Arc<Condvar>,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<WriteJob>();
@@ -125,7 +126,7 @@ impl MirrorWorker {
         let worker_mirror = mirror;
         let worker_thread = thread::spawn(move || {
             for job in rx {
-                if let Err(e) = Self::handle_job(&worker_mirror, &nodes, job, &cache_cond) {
+                if let Err(e) = Self::handle_job(&worker_mirror, &nodes, &lru_manager, job, &cache_cond) {
                     debug!("Failed to execute write job: {e:?}");
                 }
             }
@@ -141,6 +142,7 @@ impl MirrorWorker {
     fn handle_job(
         mirror: &Arc<dyn Mirror + Send + Sync>,
         nodes: &Arc<RwLock<Nodes>>,
+        lru_manager: &Arc<LruManager>,
         job: WriteJob,
         cache_cond: &Arc<Condvar>,
     ) -> std::io::Result<()> {
@@ -198,6 +200,7 @@ impl MirrorWorker {
                         mirror.write(ino, &data[start..end], start as u64, &path_resolver)?;
                     }
                 }
+                lru_manager.mark_as_clean(ino);
                 cache_cond.notify_all();
             }
             WriteJob::SetAttr { ino, attr } => {
