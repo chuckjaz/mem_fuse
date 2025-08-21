@@ -53,7 +53,7 @@ impl LruManager {
         let mut evicted = Vec::new();
         while data.current_size + content_len > self.max_size {
             let mut evicted_one = false;
-            if let Some((lru_ino, (lru_content, lru_len, lru_dirty))) = data.cache.peek_lru() {
+            if let Some((lru_ino, ( _, _, lru_dirty))) = data.cache.peek_lru() {
                 if *lru_ino == ino {
                     // This can happen if we are updating an existing file that is also the LRU one.
                     // We should not evict it in this case.

@@ -25,7 +25,7 @@ pub struct FuseCommand {
     /// The location of the mirror
     mirror: Option<String>,
     /// The size of the lru cache in Mb
-    #[arg(long, default_value_t = 1024)]
+    #[arg(long, default_value_t = 512)]
     cache_size: u64,
     /// The maximum size of the cache for writes in Mb
     #[arg(long, default_value_t = 1024)]
