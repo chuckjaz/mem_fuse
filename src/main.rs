@@ -75,3 +75,8 @@ fn start_fuse(
     fuser::mount2(filesystem, path, &[])?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    include!("tests/mirror_tests.rs");
+}
