@@ -79,4 +79,5 @@ fn start_fuse(
 #[cfg(test)]
 mod tests {
     include!("tests/mirror_tests.rs");
+    include!("tests/dirty_tests.rs");
 }
