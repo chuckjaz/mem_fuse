@@ -4,9 +4,7 @@ An in-memory FUSE filesystem written in Rust.
 
 ## Description
 
-`mem-fuse` is a simple in-memory filesystem that implements a subset of the FUSE API. It is intended as a base-line implementation using the `fuser` crate to implement a FUSE filesystem to determine overhead of FUSE and Rust in building a FUSE.
-
-The filesystem supports creating files, directories, and symbolic links. It also supports reading and writing to files, as well as reading directory contents.
+`mem-fuse` is an in-memory filesystem that implements a subset of the FUSE API that can act as a in-memory cache of a different file system. These other file systems are mirrored, by mirroring all changes in the in-memory file system to the mirrored filesystem.
 
 The filesystem can be backed by a "mirror". A mirror is a secondary storage layer that `mem-fuse` will keep in sync with its in-memory state. There are two types of mirrors available:
 
@@ -28,7 +26,7 @@ The filesystem can be backed by a "mirror". A mirror is a secondary storage laye
 To build the project, run:
 
 ```bash
-cargo build
+cargo build --release
 ```
 
 To run the filesystem, you need to specify a mount point.
