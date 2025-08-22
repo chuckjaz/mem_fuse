@@ -80,4 +80,5 @@ fn start_fuse(
 mod tests {
     include!("tests/mirror_tests.rs");
     include!("tests/dirty_tests.rs");
+    include!("tests/lru_cache_tests.rs");
 }
