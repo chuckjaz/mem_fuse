@@ -196,12 +196,13 @@ impl MirrorWorker {
                 if let Some(data) = data_to_write {
                     let data = data.read().unwrap();
                     for (start, end) in regions {
-                        let start = start as usize;
-                        let end = end as usize;
-                        if end > data.len() {
+                        let start = start as u64;
+                        let end = end as u64;
+                        if end > data.length {
                             continue;
                         }
-                        mirror.write(ino, &data[start..end], start as u64, &path_resolver)?;
+                        let data_to_write = data.read(start, (end - start) as u32);
+                        mirror.write(ino, &data_to_write, start, &path_resolver)?;
                     }
                 }
                 lru_manager.mark_as_clean(ino);
