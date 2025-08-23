@@ -34,6 +34,7 @@ fn test_disk_mirroring() {
         500 * 1024 * 1024,
         500 * 1024 * 1024,
         false,
+        crate::node::DEFAULT_BLOCK_SIZE,
     );
 
     // 1. Create a directory
@@ -132,6 +133,7 @@ fn test_lru_eviction() {
         1024 * 1024,
         1024 * 1024,
         false,
+        crate::node::DEFAULT_BLOCK_SIZE,
     );
 
     // Create file 1 (0.6 MB)
@@ -199,7 +201,7 @@ fn test_lru_eviction() {
 #[test]
 fn test_lru_eviction_dirty() {
     // 1MB cache size, no disk worker
-    let mut fuse = MemoryFuse::new(None, 1024 * 1024, 1024 * 1024, false);
+    let mut fuse = MemoryFuse::new(None, 1024 * 1024, 1024 * 1024, false, crate::node::DEFAULT_BLOCK_SIZE);
 
     // Create file 1 (0.6 MB)
     let file1_name = OsStr::new("file1.txt");
@@ -239,6 +241,7 @@ fn test_lazy_load() {
         1024 * 1024,
         1024 * 1024,
         true,
+        crate::node::DEFAULT_BLOCK_SIZE,
     );
 
     // 3. Verify that initially, only the root directory is loaded

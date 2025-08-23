@@ -1,4 +1,5 @@
 use std::{
+    cmp::{max, min},
     collections::HashMap, ffi::{OsStr, OsString}, os::unix::ffi::OsStrExt, path::Path, sync::{atomic::{AtomicUsize, Ordering}, Arc, RwLock, Condvar}, time::SystemTime, u32
 };
 
@@ -21,6 +22,7 @@ pub(crate) struct MemoryFuse {
     mirror_worker: Option<MirrorWorker>,
     mirror: Option<Arc<dyn Mirror + Send + Sync>>,
     lru_manager: Arc<LruManager>,
+    block_size: usize,
 }
 
 impl MemoryFuse {
@@ -29,6 +31,7 @@ impl MemoryFuse {
         cache_size: u64,
         cache_max_write_size: u64,
         lazy_load: bool,
+        block_size: usize,
     ) -> MemoryFuse {
         let nodes_arc = Arc::new(RwLock::new(Nodes::new()));
 
@@ -101,6 +104,7 @@ impl MemoryFuse {
             mirror_worker,
             mirror,
             lru_manager,
+            block_size,
         }
     }
 
@@ -264,7 +268,9 @@ impl MemoryFuse {
                 .unwrap()
                 .read_file(ino, &path_resolver)
                 .unwrap_or_default();
-            Arc::new(RwLock::new(new_data))
+            let mut file_blocks = crate::node::FileBlocks::new(self.block_size);
+            file_blocks.write(0, &new_data);
+            Arc::new(RwLock::new(file_blocks))
         };
 
         if let Some(mode) = mode { attr.perm = mode as u16; }
@@ -276,7 +282,7 @@ impl MemoryFuse {
         if let Some(flags) = flags { attr.flags = flags; }
 
         let evicted = if let Some(size) = size {
-            data.write().unwrap().resize(size as usize, 0u8);
+            data.write().unwrap().truncate(size);
             attr.size = size;
             self.lru_manager
                 .put(ino, data.clone(), self.mirror.is_some(), true)?
@@ -355,7 +361,7 @@ impl MemoryFuse {
                 .send(WriteJob::CreateFile { ino: attr.ino, parent, name: name.to_owned(), attr })
                 .unwrap();
         }
-        let node = Node::new_file(attr);
+        let node = Node::new_file(attr, self.block_size);
         nodes.insert(node)
     }
 
@@ -609,7 +615,9 @@ impl MemoryFuse {
                 .unwrap()
                 .read_file(ino, &path_resolver)
                 .unwrap_or_default();
-            let new_data_arc = Arc::new(RwLock::new(new_data));
+            let mut file_blocks = crate::node::FileBlocks::new(self.block_size);
+            file_blocks.write(0, &new_data);
+            let new_data_arc = Arc::new(RwLock::new(file_blocks));
 
             let evicted = self.lru_manager.put(
                 ino,
@@ -638,12 +646,11 @@ impl MemoryFuse {
 
         let data = data_arc.read().unwrap();
         let effective_offset = if offset < 0 {
-            max(0, (data.len() as i64 + offset) as usize)
+            max(0, data.length as i64 + offset) as u64
         } else {
-            min(offset as usize, data.len())
+            min(offset as u64, data.length)
         };
-        let effective_end = min(effective_offset + size as usize, data.len());
-        Ok(data[effective_offset..effective_end].to_vec())
+        Ok(data.read(effective_offset, size))
     }
 
     pub(crate) fn write_file(&mut self, ino: u64, offset: i64, new_data: &[u8]) -> Result<usize> {
@@ -667,13 +674,15 @@ impl MemoryFuse {
             data_arc
         } else {
             let path_resolver = PathResolver::new(&self.nodes);
-            let new_data = self
+            let initial_data = self
                 .mirror
                 .as_ref()
                 .unwrap()
                 .read_file(ino, &path_resolver)
                 .unwrap_or_default();
-            Arc::new(RwLock::new(new_data))
+            let mut file_blocks = crate::node::FileBlocks::new(self.block_size);
+            file_blocks.write(0, &initial_data);
+            Arc::new(RwLock::new(file_blocks))
         };
 
         let new_size;
@@ -681,20 +690,12 @@ impl MemoryFuse {
         {
             let mut data_w = data.write().unwrap();
             effective_offset = if offset < 0 {
-                (data_w.len() as i64 + offset) as usize
+                (data_w.length as i64 + offset) as u64
             } else {
-                offset as usize
+                offset as u64
             };
-            let effective_size = effective_offset + new_data.len();
-            new_size = if effective_size > data_w.len() {
-                effective_size
-            } else {
-                data_w.len()
-            };
-            if new_size > data_w.len() {
-                data_w.resize(new_size, 0u8);
-            }
-            data_w[effective_offset..effective_size].copy_from_slice(new_data);
+            data_w.write(effective_offset, new_data);
+            new_size = data_w.length;
         }
 
         let evicted = self.lru_manager.put(
@@ -706,14 +707,14 @@ impl MemoryFuse {
 
         let mut nodes = self.nodes.write().unwrap();
         let node = nodes.get_mut(ino)?;
-        node.attr.size = new_size as u64;
+        node.attr.size = new_size;
         if let NodeKind::File(file) = &mut node.kind {
             if file.content.is_ondisk() {
                 file.content = FileContent::InMemory(data.clone());
             }
             file.dirty = true;
             file.dirty_regions
-                .add_region(effective_offset as u64, (effective_offset + new_data.len()) as u64);
+                .add_region(effective_offset, effective_offset + new_data.len() as u64);
             for (evicted_ino, evicted_content) in evicted {
                 if let Ok(node) = nodes.get_mut(evicted_ino) {
                     if let NodeKind::File(file) = &mut node.kind {
@@ -1152,14 +1153,6 @@ impl ToSystemTime for TimeOrNow {
 
 
 const MEM_TTL: std::time::Duration = std::time::Duration::from_secs(30);
-
-fn max(a: usize, b: usize) -> usize {
-    if a > b { a } else { b }
-}
-
-fn min(a: usize, b: usize) -> usize {
-    if a < b { a } else { b }
-}
 
 pub(crate) trait OrError<R> {
     fn or_error(self, err: c_int) -> Result<R>;

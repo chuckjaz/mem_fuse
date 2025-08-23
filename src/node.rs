@@ -54,9 +54,98 @@ impl Directory {
     }
 }
 
+pub const DEFAULT_BLOCK_SIZE: usize = 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileBlocks {
+    pub blocks: Vec<Vec<u8>>,
+    pub block_size: usize,
+    pub length: u64,
+}
+
+impl FileBlocks {
+    pub fn new(block_size: usize) -> Self {
+        Self {
+            blocks: Vec::new(),
+            block_size,
+            length: 0,
+        }
+    }
+
+    pub fn read(&self, offset: u64, size: u32) -> Vec<u8> {
+        let mut data = Vec::with_capacity(size as usize);
+        if offset >= self.length {
+            return data;
+        }
+
+        let mut remaining_size = std::cmp::min(size as u64, self.length - offset) as usize;
+        let mut current_offset = offset;
+
+        while remaining_size > 0 {
+            let block_index = (current_offset / self.block_size as u64) as usize;
+            let offset_in_block = (current_offset % self.block_size as u64) as usize;
+            let read_size = std::cmp::min(remaining_size, self.block_size - offset_in_block);
+
+            if block_index < self.blocks.len() {
+                let block = &self.blocks[block_index];
+                let end = std::cmp::min(offset_in_block + read_size, block.len());
+                data.extend_from_slice(&block[offset_in_block..end]);
+            } else {
+                // Reading from a hole, which is all zeros
+                data.extend(std::iter::repeat(0).take(read_size));
+            }
+            remaining_size -= read_size;
+            current_offset += read_size as u64;
+        }
+        data
+    }
+
+    pub fn write(&mut self, offset: u64, new_data: &[u8]) {
+        let new_length = offset + new_data.len() as u64;
+        if new_length > self.length {
+            self.length = new_length;
+        }
+
+        let num_blocks = (self.length as f64 / self.block_size as f64).ceil() as usize;
+        if num_blocks > self.blocks.len() {
+            self.blocks.resize(num_blocks, Vec::new());
+        }
+
+        let mut remaining_data = new_data;
+        let mut current_offset = offset;
+
+        while !remaining_data.is_empty() {
+            let block_index = (current_offset / self.block_size as u64) as usize;
+            let offset_in_block = (current_offset % self.block_size as u64) as usize;
+            let write_size = std::cmp::min(remaining_data.len(), self.block_size - offset_in_block);
+
+            let block = &mut self.blocks[block_index];
+            let required_size = offset_in_block + write_size;
+            if block.len() < required_size {
+                block.resize(required_size, 0);
+            }
+            block[offset_in_block..required_size]
+                .copy_from_slice(&remaining_data[..write_size]);
+
+            remaining_data = &remaining_data[write_size..];
+            current_offset += write_size as u64;
+        }
+    }
+
+    pub fn truncate(&mut self, size: u64) {
+        self.length = size;
+        let num_blocks = (self.length as f64 / self.block_size as f64).ceil() as usize;
+        self.blocks.truncate(num_blocks);
+        if let Some(last_block) = self.blocks.last_mut() {
+            let last_block_size = (self.length % self.block_size as u64) as usize;
+            last_block.truncate(last_block_size);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub enum FileContent {
-    InMemory(Arc<RwLock<Vec<u8>>>),
+    InMemory(Arc<RwLock<FileBlocks>>),
     OnDisk,
 }
 
@@ -74,9 +163,9 @@ pub struct File {
 }
 
 impl File {
-    pub fn new() -> Self {
+    pub fn new(block_size: usize) -> Self {
         Self {
-            content: FileContent::InMemory(Arc::new(RwLock::new(Vec::new()))),
+            content: FileContent::InMemory(Arc::new(RwLock::new(FileBlocks::new(block_size)))),
             dirty: false,
             dirty_regions: DirtyRegions::new(),
         }
@@ -117,10 +206,10 @@ pub struct Node {
 }
 
 impl Node {
-    pub fn new_file(attr: FileAttr) -> Self {
+    pub fn new_file(attr: FileAttr, block_size: usize) -> Self {
         Self {
             attr,
-            kind: NodeKind::File(File::new()),
+            kind: NodeKind::File(File::new(block_size)),
         }
     }
 

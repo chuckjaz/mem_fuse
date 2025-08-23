@@ -1,9 +1,10 @@
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use lru::LruCache;
 use libc;
+use crate::node::FileBlocks;
 
 struct CacheData {
-    cache: LruCache<u64, (Arc<RwLock<Vec<u8>>>, u64, bool)>, // content, len, is_dirty
+    cache: LruCache<u64, (Arc<RwLock<FileBlocks>>, u64, bool)>, // content, len, is_dirty
     current_size: u64,
     dirty_size: u64,
 }
@@ -32,11 +33,11 @@ impl LruManager {
     pub fn put(
         &self,
         ino: u64,
-        content: Arc<RwLock<Vec<u8>>>,
+        content: Arc<RwLock<FileBlocks>>,
         has_mirror: bool,
         dirty: bool,
-    ) -> Result<Vec<(u64, Arc<RwLock<Vec<u8>>>)>, libc::c_int> {
-        let content_len = content.read().unwrap().len() as u64;
+    ) -> Result<Vec<(u64, Arc<RwLock<FileBlocks>>)>, libc::c_int> {
+        let content_len = content.read().unwrap().length;
         let mut data = self.data.lock().unwrap();
 
         let new_dirty_len = if dirty { content_len } else { 0 };
@@ -102,7 +103,7 @@ impl LruManager {
         }
     }
 
-    pub fn get(&self, ino: &u64) -> Option<Arc<RwLock<Vec<u8>>>> {
+    pub fn get(&self, ino: &u64) -> Option<Arc<RwLock<FileBlocks>>> {
         self.data.lock().unwrap().cache.get_mut(ino).map(|(c, _, _)| c.clone())
     }
 

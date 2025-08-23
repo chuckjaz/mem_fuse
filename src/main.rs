@@ -36,6 +36,9 @@ pub struct FuseCommand {
     #[arg(short, long)]
     /// The root node of the invariant files server, ignored otherwise
     root: Option<u64>,
+    /// The block size for files in Mb
+    #[arg(long, default_value_t = 1)]
+    block_size: usize,
 }
 
 fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
@@ -53,6 +56,7 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
         config.cache_max_write_size * 1024 * 1024,
         config.lazy_load,
         config.root,
+        config.block_size * 1024 * 1024,
     )?;
 
     Ok(())
@@ -68,17 +72,20 @@ fn start_fuse(
     cache_max_write_size: u64,
     lazy_load: bool,
     root: Option<u64>,
+    block_size: usize,
 ) -> Result<(), Box<dyn Error + Sync + Send>> {
     let mirror: Option<Arc<dyn Mirror + Send + Sync>> =
         mirror.map(|mirror_str| create_mirror(&mirror_str, root));
-    let filesystem = MemoryFuse::new(mirror, cache_size, cache_max_write_size, lazy_load);
+    let filesystem = MemoryFuse::new(mirror, cache_size, cache_max_write_size, lazy_load, block_size);
     fuser::mount2(filesystem, path, &[])?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::node::FileBlocks;
     include!("tests/mirror_tests.rs");
     include!("tests/dirty_tests.rs");
     include!("tests/lru_cache_tests.rs");
+    include!("tests/block_storage_tests.rs");
 }
