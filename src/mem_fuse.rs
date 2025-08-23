@@ -9,18 +9,35 @@ use libc::{RENAME_NOREPLACE, RENAME_EXCHANGE};
 use log::{debug, info};
 use users::{get_current_gid, get_current_uid};
 
+use crate::block::Block;
 use crate::lru_cache::LruManager;
 use crate::mirror::{Mirror, MirrorDirEntry, MirrorWorker, PathResolver, WriteJob};
 use crate::node::{DirectoryKind, FileContent, Node, NodeKind, Nodes};
+use std::os::unix::ffi::OsStringExt;
+use std::path::PathBuf;
 
 pub(crate) type Result<T> = std::result::Result<T, c_int>;
 
 pub(crate) struct MemoryFuse {
     pub(crate) nodes: Arc<RwLock<Nodes>>,
-    next_ino: AtomicUsize,
-    mirror_worker: Option<MirrorWorker>,
+    next_ino: Arc<AtomicUsize>,
+    mirror_worker: Option<Arc<MirrorWorker>>,
     mirror: Option<Arc<dyn Mirror + Send + Sync>>,
     lru_manager: Arc<LruManager>,
+    block_size: u64,
+}
+
+impl Clone for MemoryFuse {
+    fn clone(&self) -> Self {
+        Self {
+            nodes: self.nodes.clone(),
+            next_ino: self.next_ino.clone(),
+            mirror_worker: self.mirror_worker.as_ref().map(|w| w.clone()),
+            mirror: self.mirror.clone(),
+            lru_manager: self.lru_manager.clone(),
+            block_size: self.block_size,
+        }
+    }
 }
 
 impl MemoryFuse {
@@ -29,36 +46,48 @@ impl MemoryFuse {
         cache_size: u64,
         cache_max_write_size: u64,
         lazy_load: bool,
+        block_size: u64,
     ) -> MemoryFuse {
         let nodes_arc = Arc::new(RwLock::new(Nodes::new()));
 
-        let next_ino_atomic = AtomicUsize::new(2);
+        let next_ino_atomic = Arc::new(AtomicUsize::new(2));
+        let attr = new_attr(
+            1,
+            fuser::FileType::Directory,
+            0o755,
+            get_current_uid(),
+            get_current_gid(),
+            None,
+        );
+        let root = Node::new_directory(attr);
+        {
+            let mut nodes = nodes_arc.write().unwrap();
+            let _ = nodes.insert(root);
+        }
+
         if lazy_load {
             if let Some(mirror) = &mirror {
-                let root_attr = new_attr(
-                    1,
-                    fuser::FileType::Directory,
-                    0o755,
-                    get_current_uid(),
-                    get_current_gid(),
-                    None,
-                );
-                let root = Node::new_directory(root_attr);
-                {
-                    let mut nodes = nodes_arc.write().unwrap();
-                    let _ = nodes.insert(root);
-                }
                 let new_entries = {
                     let path_resolver = PathResolver::new(&nodes_arc);
                     mirror.read_dir(1, &path_resolver).unwrap()
                 };
 
-                let new_dir = Self::process_directory_entries(
+                let mut fuse = MemoryFuse {
+                    nodes: nodes_arc.clone(),
+                    next_ino: next_ino_atomic.clone(),
+                    mirror_worker: None,
+                    mirror: Some(mirror.clone()),
+                    lru_manager: Arc::new(LruManager::new(0, 0, Arc::new(Condvar::new()))),
+                    block_size,
+                };
+
+                let new_dir = fuse.process_directory_entries(
                     mirror,
                     1,
                     &nodes_arc,
-                    &next_ino_atomic,
+                    &fuse.next_ino.clone(),
                     new_entries,
+                    block_size,
                 ).unwrap();
 
                 {
@@ -69,18 +98,6 @@ impl MemoryFuse {
                     }
                 }
             }
-        } else {
-            let attr = new_attr(
-                1,
-                fuser::FileType::Directory,
-                0o755,
-                get_current_uid(),
-                get_current_gid(),
-                None,
-            );
-            let root = Node::new_directory(attr);
-            let mut nodes = nodes_arc.write().unwrap();
-            let _ = nodes.insert(root);
         }
 
 
@@ -92,7 +109,7 @@ impl MemoryFuse {
         ));
 
         let mirror_worker = mirror.clone().map(|mirror| {
-            MirrorWorker::new(mirror, nodes_arc.clone(), lru_manager.clone(), cache_cond.clone())
+            Arc::new(MirrorWorker::new(mirror, nodes_arc.clone(), lru_manager.clone(), cache_cond.clone()))
         });
 
         Self {
@@ -101,6 +118,7 @@ impl MemoryFuse {
             mirror_worker,
             mirror,
             lru_manager,
+            block_size,
         }
     }
 
@@ -127,11 +145,13 @@ impl MemoryFuse {
     }
 
     fn process_directory_entries(
+        &mut self,
         mirror: &Arc<dyn Mirror + Send + Sync>,
         parent: u64,
         nodes: &Arc<RwLock<Nodes>>,
-        next_ino: &AtomicUsize,
+        next_ino: &Arc<AtomicUsize>,
         entries: Vec<MirrorDirEntry>,
+        block_size: u64,
     ) -> Result<crate::node::Directory> {
         let mut new_dir = crate::node::Directory::new();
         let mut ino_map = HashMap::new();
@@ -157,7 +177,7 @@ impl MemoryFuse {
             let new_node = if attr.kind == fuser::FileType::Directory {
                 Node::new_directory_on_disk(attr)
             } else if attr.kind == fuser::FileType::RegularFile {
-                Node::new_file_on_disk(attr)
+                Node::new_file_on_disk(attr, block_size)
             } else {
                 let path_resolver = PathResolver::new(nodes);
                 let target = mirror.read_link(original_ino, &path_resolver).unwrap();
@@ -195,12 +215,14 @@ impl MemoryFuse {
                 mirror.read_dir(ino, &path_resolver).unwrap()
             };
 
-            let new_dir = Self::process_directory_entries(
+            let mut fuse = self.clone();
+            let new_dir = fuse.process_directory_entries(
                 &mirror,
                 ino,
-                &self.nodes,
+                &self.nodes.clone(),
                 &self.next_ino,
                 entries,
+                self.block_size,
             )?;
 
             let mut nodes = self.nodes.write().unwrap();
@@ -212,7 +234,7 @@ impl MemoryFuse {
         Ok(())
     }
 
-    fn set_attr(
+    pub(crate) fn set_attr(
         &mut self,
         ino: u64,
         mode: Option<u32>,
@@ -224,102 +246,49 @@ impl MemoryFuse {
         ctime: Option<SystemTime>,
         flags: Option<u32>,
     ) -> Result<FileAttr> {
-        let (data_arc, mut attr) = {
-            let mut nodes = self.nodes.write().unwrap();
-            let node = nodes.get_mut(ino)?;
-            let mut attr_clone = node.attr;
-            if let NodeKind::File(file) = &mut node.kind {
-                let d = match &mut file.content {
-                    FileContent::InMemory(data) => {
-                        self.lru_manager.get(&ino);
-                        Some(data.clone())
-                    }
-                    FileContent::OnDisk => None,
-                };
-                (d, attr_clone)
-            } else {
-                // Not a file, handle other attributes
-                if let Some(mode) = mode { attr_clone.perm = mode as u16; }
-                if let Some(uid) = uid { attr_clone.uid = uid; }
-                if let Some(gid) = gid { attr_clone.gid = gid; }
-                if let Some(atime) = atime { attr_clone.atime = atime.to_time(); }
-                if let Some(mtime) = mtime { attr_clone.mtime = mtime.to_time(); }
-                if let Some(ctime) = ctime { attr_clone.ctime = ctime; }
-                if let Some(flags) = flags { attr_clone.flags = flags; }
-                node.attr = attr_clone;
-                if let Some(worker) = &self.mirror_worker {
-                    worker.sender().send(WriteJob::SetAttr { ino, attr: attr_clone }).unwrap();
-                }
-                return Ok(attr_clone);
-            }
-        };
-
-        let data = if let Some(data_arc) = data_arc {
-            data_arc
-        } else {
-            let path_resolver = PathResolver::new(&self.nodes);
-            let new_data = self
-                .mirror
-                .as_ref()
-                .unwrap()
-                .read_file(ino, &path_resolver)
-                .unwrap_or_default();
-            Arc::new(RwLock::new(new_data))
-        };
-
-        if let Some(mode) = mode { attr.perm = mode as u16; }
-        if let Some(uid) = uid { attr.uid = uid; }
-        if let Some(gid) = gid { attr.gid = gid; }
-        if let Some(atime) = atime { attr.atime = atime.to_time(); }
-        if let Some(mtime) = mtime { attr.mtime = mtime.to_time(); }
-        if let Some(ctime) = ctime { attr.ctime = ctime; }
-        if let Some(flags) = flags { attr.flags = flags; }
-
-        let evicted = if let Some(size) = size {
-            data.write().unwrap().resize(size as usize, 0u8);
-            attr.size = size;
-            self.lru_manager
-                .put(ino, data.clone(), self.mirror.is_some(), true)?
-        } else {
-            Vec::new()
-        };
-
         let mut nodes = self.nodes.write().unwrap();
         let node = nodes.get_mut(ino)?;
-        let old_size = node.attr.size;
-        node.attr = attr;
+
         if let NodeKind::File(file) = &mut node.kind {
-            if file.content.is_ondisk() {
-                file.content = FileContent::InMemory(data.clone());
-            }
             if let Some(size) = size {
+                let old_size = node.attr.size;
                 if size < old_size {
-                    file.dirty_regions.truncate(size);
-                } else {
-                    file.dirty_regions.add_region(old_size, size);
-                }
-                file.dirty = true;
-            }
-        }
-        for (evicted_ino, evicted_content) in evicted {
-            if let Ok(node) = nodes.get_mut(evicted_ino) {
-                if let NodeKind::File(file) = &mut node.kind {
-                    if let FileContent::InMemory(existing_content) = &file.content {
-                        if Arc::ptr_eq(&evicted_content, existing_content) {
-                            file.content = FileContent::OnDisk;
+                    let last_block_id = size / file.block_size;
+                    let new_size_in_last_block = (size % file.block_size) as usize;
+
+                    if let FileContent::InMemoryBlocks(blocks_arc) = &file.content {
+                        let mut blocks = blocks_arc.write().unwrap();
+                        blocks.retain(|&block_id, _| block_id <= last_block_id);
+                        if let Some(last_block) = blocks.get(&last_block_id) {
+                            let mut last_block_data = last_block.read();
+                            let mut last_block_data = last_block_data.write().unwrap();
+                            last_block_data.truncate(new_size_in_last_block);
                         }
                     }
+                    file.dirty_blocks.truncate(file.block_size, size);
                 }
+                node.attr.size = size;
+                file.dirty = true;
             }
+        } else {
+            // Not a file, handle other attributes
+            if let Some(mode) = mode { node.attr.perm = mode as u16; }
+            if let Some(uid) = uid { node.attr.uid = uid; }
+            if let Some(gid) = gid { node.attr.gid = gid; }
         }
 
+        if let Some(atime) = atime { node.attr.atime = atime.to_time(); }
+        if let Some(mtime) = mtime { node.attr.mtime = mtime.to_time(); }
+        if let Some(ctime) = ctime { node.attr.ctime = ctime; }
+        if let Some(flags) = flags { node.attr.flags = flags; }
+
         if let Some(worker) = &self.mirror_worker {
-            worker.sender().send(WriteJob::SetAttr { ino, attr }).unwrap();
+            worker.sender().send(WriteJob::SetAttr { ino, attr: node.attr }).unwrap();
             if size.is_some() {
                 worker.sender().send(WriteJob::Write { ino }).unwrap();
             }
         }
-        Ok(attr)
+        Ok(node.attr)
     }
 
     fn read_link(&mut self, ino: u64) -> Result<Vec<u8>> {
@@ -355,7 +324,7 @@ impl MemoryFuse {
                 .send(WriteJob::CreateFile { ino: attr.ino, parent, name: name.to_owned(), attr })
                 .unwrap();
         }
-        let node = Node::new_file(attr);
+        let node = Node::new_file(attr, self.block_size);
         nodes.insert(node)
     }
 
@@ -475,7 +444,7 @@ impl MemoryFuse {
         };
 
         if nlink == 1 {
-            self.lru_manager.remove(&ino);
+            self.lru_manager.remove(ino);
         }
 
         let mut nodes = self.nodes.write().unwrap();
@@ -582,152 +551,177 @@ impl MemoryFuse {
         Ok(())
     }
 
-    pub(crate) fn read_file(&mut self, ino: u64, offset: i64, size: u32) -> Result<Vec<u8>> {
-        let content = {
-            let nodes = self.nodes.read().unwrap();
-            let node = nodes.get(ino)?;
-            if let NodeKind::File(file) = &node.kind {
-                match &file.content {
-                    FileContent::InMemory(data) => {
-                        self.lru_manager.get(&ino);
-                        Some(data.clone())
+    fn get_or_fetch_block(&mut self, ino: u64, block_id: u64) -> Result<Block> {
+        let (block_size, blocks_arc) = {
+            let mut nodes = self.nodes.write().unwrap();
+            let node = nodes.get_mut(ino)?;
+            if let NodeKind::File(file) = &mut node.kind {
+                if let FileContent::InMemoryBlocks(blocks) = &file.content {
+                    if let Some(block) = blocks.read().unwrap().get(&block_id) {
+                        return Ok(block.clone());
                     }
-                    FileContent::OnDisk => None,
                 }
+                (file.block_size, match &mut file.content {
+                    FileContent::InMemoryBlocks(blocks) => Some(blocks.clone()),
+                    FileContent::OnDisk => None,
+                })
             } else {
                 return Err(ENOENT);
             }
         };
 
-        let data_arc = if let Some(content) = content {
-            content
+        let blocks = if let Some(blocks_arc) = blocks_arc {
+            blocks_arc
         } else {
-            let path_resolver = PathResolver::new(&self.nodes);
-            let new_data = self
-                .mirror
-                .as_ref()
-                .unwrap()
-                .read_file(ino, &path_resolver)
-                .unwrap_or_default();
-            let new_data_arc = Arc::new(RwLock::new(new_data));
-
-            let evicted = self.lru_manager.put(
-                ino,
-                new_data_arc.clone(),
-                self.mirror.is_some(),
-                false,
-            )?;
+            let new_blocks = Arc::new(RwLock::new(HashMap::new()));
             let mut nodes = self.nodes.write().unwrap();
             let node = nodes.get_mut(ino)?;
             if let NodeKind::File(file) = &mut node.kind {
-                file.content = FileContent::InMemory(new_data_arc.clone());
+                file.content = FileContent::InMemoryBlocks(new_blocks.clone());
             }
-            for (evicted_ino, evicted_content) in evicted {
-                if let Ok(node) = nodes.get_mut(evicted_ino) {
-                    if let NodeKind::File(file) = &mut node.kind {
-                        if let FileContent::InMemory(existing_content) = &file.content {
-                            if Arc::ptr_eq(&evicted_content, existing_content) {
-                                file.content = FileContent::OnDisk;
-                            }
-                        }
-                    }
-                }
-            }
-            new_data_arc
+            new_blocks
         };
 
-        let data = data_arc.read().unwrap();
+        let path_resolver = PathResolver::new(&self.nodes);
+        let new_data = self
+            .mirror
+            .as_ref()
+            .unwrap()
+            .read_block(ino, block_id, &path_resolver)
+            .unwrap_or_default();
+        let new_block = Block::new(new_data);
+        let evicted = self.lru_manager.put(
+            ino,
+            block_id,
+            new_block.clone(),
+            self.mirror.is_some(),
+            false,
+        )?;
+        blocks.write().unwrap().insert(block_id, new_block.clone());
+        Ok(new_block)
+    }
+
+    pub(crate) fn read_file(&mut self, ino: u64, offset: i64, size: u32) -> Result<Vec<u8>> {
+        let file_size = self.get_attr(ino)?.size;
         let effective_offset = if offset < 0 {
-            max(0, (data.len() as i64 + offset) as usize)
+            max(0, (file_size as i64 + offset)) as u64
         } else {
-            min(offset as usize, data.len())
+            min(offset as u64, file_size)
         };
-        let effective_end = min(effective_offset + size as usize, data.len());
-        Ok(data[effective_offset..effective_end].to_vec())
+        let effective_end = min(effective_offset + size as u64, file_size);
+        if effective_offset >= effective_end {
+            return Ok(Vec::new());
+        }
+        let read_size = (effective_end - effective_offset) as usize;
+        let mut result = vec![0; read_size];
+        let block_size = self.block_size;
+
+        let start_block = effective_offset / block_size;
+        let end_block = (effective_end - 1) / block_size;
+        let mut written_bytes = 0;
+
+        for block_id in start_block..=end_block {
+            let block = self.get_or_fetch_block(ino, block_id)?;
+            let block_data = block.read();
+            let block_data = block_data.read().unwrap();
+
+            let block_start_offset = block_id * block_size;
+            let read_start_in_block = if effective_offset > block_start_offset {
+                (effective_offset - block_start_offset) as usize
+            } else {
+                0
+            };
+
+            let read_end_in_block = if effective_end < block_start_offset + block_data.len() as u64 {
+                (effective_end - block_start_offset) as usize
+            } else {
+                block_data.len()
+            };
+
+            if read_start_in_block >= read_end_in_block {
+                continue;
+            }
+
+            let copy_len = read_end_in_block - read_start_in_block;
+            let result_start = written_bytes;
+            let result_end = result_start + copy_len;
+            result[result_start..result_end]
+                .copy_from_slice(&block_data[read_start_in_block..read_end_in_block]);
+            written_bytes += copy_len;
+        }
+
+        Ok(result)
     }
 
     pub(crate) fn write_file(&mut self, ino: u64, offset: i64, new_data: &[u8]) -> Result<usize> {
-        let data_arc = {
+        let file_size = self.get_attr(ino)?.size;
+        let effective_offset = if offset < 0 {
+            max(0, file_size as i64 + offset) as u64
+        } else {
+            offset as u64
+        };
+        let new_size = max(file_size as i64, (effective_offset + new_data.len() as u64) as i64) as u64;
+
+        let block_size = self.block_size;
+        let start_block = effective_offset / block_size;
+        let end_block = (effective_offset + new_data.len() as u64 - 1) / block_size;
+        let mut read_bytes = 0;
+
+        for block_id in start_block..=end_block {
+            let block = self.get_or_fetch_block(ino, block_id)?;
+            let mut block_data_arc = block.read();
+            let mut block_data = block_data_arc.write().unwrap();
+
+            let block_start_offset = block_id * block_size;
+            let write_start_in_block = if effective_offset > block_start_offset {
+                (effective_offset - block_start_offset) as usize
+            } else {
+                0
+            };
+
+            let write_end_in_block = min(
+                block_size,
+                effective_offset + new_data.len() as u64 - block_start_offset,
+            ) as usize;
+
+            let copy_len = write_end_in_block - write_start_in_block;
+            if block_data.len() < write_end_in_block {
+                block_data.resize(write_end_in_block, 0);
+            }
+            block_data[write_start_in_block..write_end_in_block]
+                .copy_from_slice(&new_data[read_bytes..read_bytes + copy_len]);
+            read_bytes += copy_len;
+
+            let evicted = self.lru_manager.put(
+                ino,
+                block_id,
+                block.clone(),
+                self.mirror.is_some(),
+                true,
+            )?;
+
             let mut nodes = self.nodes.write().unwrap();
             let node = nodes.get_mut(ino)?;
             if let NodeKind::File(file) = &mut node.kind {
-                match &mut file.content {
-                    FileContent::InMemory(data) => {
-                        self.lru_manager.get(&ino);
-                        Some(data.clone())
-                    }
-                    FileContent::OnDisk => None,
-                }
-            } else {
-                return Err(ENOENT);
-            }
-        };
-
-        let data = if let Some(data_arc) = data_arc {
-            data_arc
-        } else {
-            let path_resolver = PathResolver::new(&self.nodes);
-            let new_data = self
-                .mirror
-                .as_ref()
-                .unwrap()
-                .read_file(ino, &path_resolver)
-                .unwrap_or_default();
-            Arc::new(RwLock::new(new_data))
-        };
-
-        let new_size;
-        let effective_offset;
-        {
-            let mut data_w = data.write().unwrap();
-            effective_offset = if offset < 0 {
-                (data_w.len() as i64 + offset) as usize
-            } else {
-                offset as usize
-            };
-            let effective_size = effective_offset + new_data.len();
-            new_size = if effective_size > data_w.len() {
-                effective_size
-            } else {
-                data_w.len()
-            };
-            if new_size > data_w.len() {
-                data_w.resize(new_size, 0u8);
-            }
-            data_w[effective_offset..effective_size].copy_from_slice(new_data);
-        }
-
-        let evicted = self.lru_manager.put(
-            ino,
-            data.clone(),
-            self.mirror.is_some(),
-            true,
-        )?;
-
-        let mut nodes = self.nodes.write().unwrap();
-        let node = nodes.get_mut(ino)?;
-        node.attr.size = new_size as u64;
-        if let NodeKind::File(file) = &mut node.kind {
-            if file.content.is_ondisk() {
-                file.content = FileContent::InMemory(data.clone());
-            }
-            file.dirty = true;
-            file.dirty_regions
-                .add_region(effective_offset as u64, (effective_offset + new_data.len()) as u64);
-            for (evicted_ino, evicted_content) in evicted {
-                if let Ok(node) = nodes.get_mut(evicted_ino) {
-                    if let NodeKind::File(file) = &mut node.kind {
-                        if let FileContent::InMemory(existing_content) = &file.content {
-                            if Arc::ptr_eq(&evicted_content, existing_content) {
-                                file.content = FileContent::OnDisk;
+                file.dirty = true;
+                file.dirty_blocks.add_block(block_id);
+                if let FileContent::InMemoryBlocks(blocks) = &mut file.content {
+                    for ((_evicted_ino, evicted_block_id), evicted_block) in evicted {
+                        if let Some(b) = blocks.read().unwrap().get(&evicted_block_id) {
+                            if Arc::ptr_eq(&b.read(), &evicted_block.read()) {
+                                blocks.write().unwrap().remove(&evicted_block_id);
                             }
                         }
                     }
                 }
             }
-            if let Some(worker) = &self.mirror_worker {
-                worker.sender().send(WriteJob::Write { ino }).unwrap();
-            }
+        }
+
+        let mut nodes = self.nodes.write().unwrap();
+        let node = nodes.get_mut(ino)?;
+        node.attr.size = new_size;
+        if let Some(worker) = &self.mirror_worker {
+            worker.sender().send(WriteJob::Write { ino }).unwrap();
         }
 
         Ok(new_data.len())
@@ -755,7 +749,9 @@ impl Filesystem for MemoryFuse {
     fn destroy(&mut self) {
         info!("destroying");
         if let Some(worker) = self.mirror_worker.take() {
-            worker.stop();
+            if let Ok(worker) = Arc::try_unwrap(worker) {
+                worker.stop();
+            }
         }
     }
 
@@ -1153,11 +1149,11 @@ impl ToSystemTime for TimeOrNow {
 
 const MEM_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
-fn max(a: usize, b: usize) -> usize {
+fn max(a: i64, b: i64) -> i64 {
     if a > b { a } else { b }
 }
 
-fn min(a: usize, b: usize) -> usize {
+fn min(a: u64, b: u64) -> u64 {
     if a < b { a } else { b }
 }
 
