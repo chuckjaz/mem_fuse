@@ -10,7 +10,7 @@ use fuser::FileAttr;
 use indexmap::IndexMap;
 use libc::{EEXIST, ENOENT, ENOTDIR};
 
-use crate::{dirty::DirtyRegions, mem_fuse::{OrError, Result}};
+use crate::{block::Block, dirty::DirtyBlocks, mem_fuse::{OrError, Result}};
 
 #[derive(Clone)]
 pub struct Directory {
@@ -56,7 +56,7 @@ impl Directory {
 
 #[derive(Clone)]
 pub enum FileContent {
-    InMemory(Arc<RwLock<Vec<u8>>>),
+    InMemoryBlocks(Arc<RwLock<HashMap<u64, Block>>>),
     OnDisk,
 }
 
@@ -70,23 +70,26 @@ impl FileContent {
 pub struct File {
     pub content: FileContent,
     pub dirty: bool,
-    pub dirty_regions: DirtyRegions,
+    pub dirty_blocks: DirtyBlocks,
+    pub block_size: u64,
 }
 
 impl File {
-    pub fn new() -> Self {
+    pub fn new(block_size: u64) -> Self {
         Self {
-            content: FileContent::InMemory(Arc::new(RwLock::new(Vec::new()))),
+            content: FileContent::InMemoryBlocks(Arc::new(RwLock::new(HashMap::new()))),
             dirty: false,
-            dirty_regions: DirtyRegions::new(),
+            dirty_blocks: DirtyBlocks::new(),
+            block_size,
         }
     }
 
-    pub fn new_on_disk() -> Self {
+    pub fn new_on_disk(block_size: u64) -> Self {
         Self {
             content: FileContent::OnDisk,
             dirty: false,
-            dirty_regions: DirtyRegions::new(),
+            dirty_blocks: DirtyBlocks::new(),
+            block_size,
         }
     }
 }
@@ -117,17 +120,19 @@ pub struct Node {
 }
 
 impl Node {
-    pub fn new_file(attr: FileAttr) -> Self {
+    // TODO: Pass block_size down from mem_fuse
+    pub fn new_file(attr: FileAttr, block_size: u64) -> Self {
         Self {
             attr,
-            kind: NodeKind::File(File::new()),
+            kind: NodeKind::File(File::new(block_size)),
         }
     }
 
-    pub fn new_file_on_disk(attr: FileAttr) -> Self {
+    // TODO: Pass block_size down from mem_fuse
+    pub fn new_file_on_disk(attr: FileAttr, block_size: u64) -> Self {
         Self {
             attr,
-            kind: NodeKind::File(File::new_on_disk()),
+            kind: NodeKind::File(File::new_on_disk(block_size)),
         }
     }
 

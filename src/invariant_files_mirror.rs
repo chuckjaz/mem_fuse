@@ -237,18 +237,13 @@ impl Mirror for InvariantFilesMirror {
             ))
         }
     }
-
-    fn read_file<'a>(&self, ino: u64, _path_resolver: &PathResolver<'a>) -> std::io::Result<Vec<u8>> {
-        let remote_ino = self.get_remote_ino(ino);
-        let url = self.get_url(&format!("files/{remote_ino}"));
-        let response = self.client.get(url).send().map_err(to_io_error)?;
-        if !response.status().is_success() {
-            return Err(io::Error::new(
-                ErrorKind::Other,
-                format!("Failed to read file: {}", response.status()),
-            ));
-        }
-        Ok(response.bytes().map_err(to_io_error)?.to_vec())
+    fn read_block<'a>(
+        &self,
+        _ino: u64,
+        _block_id: u64,
+        _path_resolver: &PathResolver<'a>,
+    ) -> std::io::Result<Vec<u8>> {
+        Err(io::Error::new(io::ErrorKind::Other, "Not supported"))
     }
 
     fn create_file<'a>(
@@ -360,28 +355,14 @@ impl Mirror for InvariantFilesMirror {
         Ok(())
     }
 
-    fn write<'a>(
+    fn write_block<'a>(
         &self,
-        ino: u64,
-        data: &[u8],
-        offset: u64,
+        _ino: u64,
+        _block_id: u64,
+        _data: &[u8],
         _path_resolver: &PathResolver<'a>,
     ) -> std::io::Result<()> {
-        let remote_ino = self.get_remote_ino(ino);
-        let url = self.get_url(&format!("files/{remote_ino}?offset={offset}"));
-        let response = self
-            .client
-            .post(url)
-            .body(data.to_vec())
-            .send()
-            .map_err(to_io_error)?;
-        if !response.status().is_success() {
-            return Err(io::Error::new(
-                ErrorKind::Other,
-                format!("Failed to write to file: {}", response.status()),
-            ));
-        }
-        Ok(())
+        Err(io::Error::new(io::ErrorKind::Other, "Not supported"))
     }
 
     fn set_attr<'a>(

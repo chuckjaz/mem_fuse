@@ -13,6 +13,7 @@ mod dirty;
 mod mirror;
 mod mirror_factory;
 mod invariant_files_mirror;
+mod block;
 
 #[derive(Debug, Parser)]
 #[command(name = "mem_fuse")]
@@ -33,6 +34,9 @@ pub struct FuseCommand {
     /// Load files from the mirror lazily
     #[arg(long, default_value_t = true)]
     lazy_load: bool,
+    /// The block size in Mb
+    #[arg(long, default_value_t = 1)]
+    block_size: u64,
     #[arg(short, long)]
     /// The root node of the invariant files server, ignored otherwise
     root: Option<u64>,
@@ -52,6 +56,7 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
         config.cache_size * 1024 * 1024,
         config.cache_max_write_size * 1024 * 1024,
         config.lazy_load,
+        config.block_size * 1024 * 1024,
         config.root,
     )?;
 
@@ -67,11 +72,18 @@ fn start_fuse(
     cache_size: u64,
     cache_max_write_size: u64,
     lazy_load: bool,
+    block_size: u64,
     root: Option<u64>,
 ) -> Result<(), Box<dyn Error + Sync + Send>> {
     let mirror: Option<Arc<dyn Mirror + Send + Sync>> =
         mirror.map(|mirror_str| create_mirror(&mirror_str, root));
-    let filesystem = MemoryFuse::new(mirror, cache_size, cache_max_write_size, lazy_load);
+    let filesystem = MemoryFuse::new(
+        mirror,
+        cache_size,
+        cache_max_write_size,
+        lazy_load,
+        block_size,
+    );
     fuser::mount2(filesystem, path, &[])?;
     Ok(())
 }
@@ -81,4 +93,5 @@ mod tests {
     include!("tests/mirror_tests.rs");
     include!("tests/dirty_tests.rs");
     include!("tests/lru_cache_tests.rs");
+    include!("tests/block_io_tests.rs");
 }

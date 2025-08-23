@@ -86,6 +86,10 @@ pub enum WriteJob {
     Write {
         ino: u64,
     },
+    WriteBlock {
+        ino: u64,
+        block_id: u64,
+    },
     SetAttr {
         ino: u64,
         attr: FileAttr,
@@ -169,7 +173,7 @@ impl MirrorWorker {
                 mirror.create_symlink(ino, parent, &name, &target, &attr, &path_resolver)?;
             }
             WriteJob::Write { ino } => {
-                let (data_to_write, regions) = {
+                let (blocks_to_write, dirty_blocks) = {
                     let mut nodes = nodes.write().unwrap();
                     let node = match nodes.get_mut(ino) {
                         Ok(n) => n,
@@ -181,31 +185,36 @@ impl MirrorWorker {
                             return Ok(());
                         }
                         file.dirty = false;
-                        let regions = file.dirty_regions.regions().clone();
-                        file.dirty_regions.clear();
-                        if let FileContent::InMemory(data) = &file.content {
-                            (Some(data.clone()), regions)
+                        let dirty_blocks = file.dirty_blocks.blocks().clone();
+                        file.dirty_blocks.clear();
+                        if let FileContent::InMemoryBlocks(blocks) = &file.content {
+                            (Some(blocks.clone()), dirty_blocks)
                         } else {
-                            (None, regions)
+                            (None, dirty_blocks)
                         }
                     } else {
                         return Ok(());
                     }
                 };
 
-                if let Some(data) = data_to_write {
-                    let data = data.read().unwrap();
-                    for (start, end) in regions {
-                        let start = start as usize;
-                        let end = end as usize;
-                        if end > data.len() {
-                            continue;
+                if let Some(blocks) = blocks_to_write {
+                    for block_id in dirty_blocks {
+                        let block_to_write = {
+                            let blocks = blocks.read().unwrap();
+                            blocks.get(&block_id).cloned()
+                        };
+                        if let Some(block) = block_to_write {
+                            let block_data = block.read();
+                            let block_data = block_data.read().unwrap();
+                            mirror.write_block(ino, block_id, &block_data, &path_resolver)?;
                         }
-                        mirror.write(ino, &data[start..end], start as u64, &path_resolver)?;
+                        lru_manager.mark_as_clean(ino, block_id);
                     }
                 }
-                lru_manager.mark_as_clean(ino);
                 cache_cond.notify_all();
+            }
+            WriteJob::WriteBlock { ino, block_id } => {
+                // This is a placeholder. The actual implementation will be more complex.
             }
             WriteJob::SetAttr { ino, attr } => {
                 mirror.set_attr(ino, &attr, Some(attr.size), &path_resolver)?;
@@ -239,9 +248,9 @@ impl MirrorWorker {
         self.work_queue.clone()
     }
 
-    pub fn stop(mut self) {
+    pub fn stop(self) {
         self.work_queue.send(WriteJob::Shutdown).unwrap();
-        if let Some(worker_thread) = self.worker_thread.take() {
+        if let Some(worker_thread) = self.worker_thread {
             worker_thread.join().unwrap();
         }
     }
@@ -260,7 +269,13 @@ pub trait Mirror: Debug {
         path_resolver: &PathResolver<'a>,
     ) -> std::io::Result<Vec<MirrorDirEntry>>;
     fn read_link<'a>(&self, ino: u64, path_resolver: &PathResolver<'a>) -> std::io::Result<PathBuf>;
-    fn read_file<'a>(&self, ino: u64, path_resolver: &PathResolver<'a>) -> std::io::Result<Vec<u8>>;
+
+    fn read_block<'a>(
+        &self,
+        ino: u64,
+        block_id: u64,
+        path_resolver: &PathResolver<'a>,
+    ) -> std::io::Result<Vec<u8>>;
     fn create_file<'a>(
         &self,
         ino: u64,
@@ -286,11 +301,11 @@ pub trait Mirror: Debug {
         attr: &FileAttr,
         path_resolver: &PathResolver<'a>,
     ) -> std::io::Result<()>;
-    fn write<'a>(
+    fn write_block<'a>(
         &self,
         ino: u64,
+        block_id: u64,
         data: &[u8],
-        offset: u64,
         path_resolver: &PathResolver<'a>,
     ) -> std::io::Result<()>;
     fn set_attr<'a>(
@@ -406,10 +421,24 @@ impl Mirror for LocalMirror {
         fs::read_link(fs_path)
     }
 
-    fn read_file<'a>(&self, ino: u64, path_resolver: &PathResolver<'a>) -> std::io::Result<Vec<u8>> {
+    fn read_block<'a>(
+        &self,
+        ino: u64,
+        block_id: u64,
+        path_resolver: &PathResolver<'a>,
+    ) -> std::io::Result<Vec<u8>> {
         let path = path_resolver.resolve(ino)?;
         let fs_path = self.get_fs_path(&path);
-        fs::read(fs_path)
+        if !fs_path.exists() {
+            return Ok(Vec::new());
+        }
+        let file = fs::File::open(fs_path)?;
+        // TODO: Get block size from somewhere
+        let block_size = 1024 * 1024;
+        let mut buffer = vec![0; block_size];
+        let bytes_read = file.read_at(&mut buffer, block_id * block_size as u64)?;
+        buffer.truncate(bytes_read);
+        Ok(buffer)
     }
 
     fn create_file<'a>(
@@ -465,17 +494,19 @@ impl Mirror for LocalMirror {
         chown(&fs_path, Some(attr.uid), Some(attr.gid))
     }
 
-    fn write<'a>(
+    fn write_block<'a>(
         &self,
         ino: u64,
+        block_id: u64,
         data: &[u8],
-        offset: u64,
         path_resolver: &PathResolver<'a>,
     ) -> std::io::Result<()> {
         let path = path_resolver.resolve(ino)?;
         let fs_path = self.get_fs_path(&path);
-        let file = fs::OpenOptions::new().write(true).open(&fs_path)?;
-        file.write_all_at(data, offset)
+        let file = fs::OpenOptions::new().write(true).create(true).open(&fs_path)?;
+        // TODO: Get block size from somewhere
+        let block_size = 1024 * 1024;
+        file.write_all_at(data, block_id * block_size as u64)
     }
 
     fn set_attr<'a>(
