@@ -251,6 +251,32 @@ impl Mirror for InvariantFilesMirror {
         Ok(response.bytes().map_err(to_io_error)?.to_vec())
     }
 
+    fn read_block<'a>(
+        &self,
+        ino: u64,
+        block_index: usize,
+        block_size: usize,
+        _path_resolver: &PathResolver<'a>,
+    ) -> std::io::Result<Vec<u8>> {
+        let remote_ino = self.get_remote_ino(ino);
+        let url = self.get_url(&format!("files/{remote_ino}"));
+        let offset = block_index * block_size;
+        let range = format!("bytes={}-{}", offset, offset + block_size - 1);
+        let response = self
+            .client
+            .get(url)
+            .header("Range", range)
+            .send()
+            .map_err(to_io_error)?;
+        if !response.status().is_success() {
+            return Err(io::Error::new(
+                ErrorKind::Other,
+                format!("Failed to read block: {}", response.status()),
+            ));
+        }
+        Ok(response.bytes().map_err(to_io_error)?.to_vec())
+    }
+
     fn create_file<'a>(
         &self,
         ino: u64,

@@ -1,10 +1,9 @@
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex};
 use lru::LruCache;
 use libc;
-use crate::node::FileBlocks;
 
 struct CacheData {
-    cache: LruCache<u64, (Arc<RwLock<FileBlocks>>, u64, bool)>, // content, len, is_dirty
+    cache: LruCache<(u64, usize), (Vec<u8>, bool)>, // (ino, block_index) -> (data, is_dirty)
     current_size: u64,
     dirty_size: u64,
 }
@@ -33,87 +32,115 @@ impl LruManager {
     pub fn put(
         &self,
         ino: u64,
-        content: Arc<RwLock<FileBlocks>>,
-        has_mirror: bool,
+        block_index: usize,
+        data: Vec<u8>,
         dirty: bool,
-    ) -> Result<Vec<(u64, Arc<RwLock<FileBlocks>>)>, libc::c_int> {
-        let content_len = content.read().unwrap().length;
-        let mut data = self.data.lock().unwrap();
+    ) -> Result<Vec<((u64, usize), Vec<u8>)>, libc::c_int> {
+        let block_len = data.len() as u64;
+        let mut data_lock = self.data.lock().unwrap();
 
-        let new_dirty_len = if dirty { content_len } else { 0 };
-        if data.dirty_size + new_dirty_len > self.max_write_size {
-            if has_mirror {
-                while data.dirty_size + new_dirty_len > self.max_write_size {
-                    data = self.cache_cond.wait(data).unwrap();
-                }
-            } else {
-                return Err(libc::ENOSPC);
+        let new_dirty_len = if dirty { block_len } else { 0 };
+        if data_lock.dirty_size + new_dirty_len > self.max_write_size {
+            while data_lock.dirty_size + new_dirty_len > self.max_write_size {
+                data_lock = self.cache_cond.wait(data_lock).unwrap();
             }
         }
 
         let mut evicted = Vec::new();
-        while data.current_size + content_len > self.max_size {
+        while data_lock.current_size + block_len > self.max_size {
             let mut evicted_one = false;
-            if let Some((lru_ino, ( _, _, lru_dirty))) = data.cache.peek_lru() {
-                if *lru_ino == ino {
-                    // This can happen if we are updating an existing file that is also the LRU one.
-                    // We should not evict it in this case.
+            if let Some((lru_key, (_, lru_dirty))) = data_lock.cache.peek_lru() {
+                if *lru_key == (ino, block_index) {
                     break;
                 }
-                if !lru_dirty {
-                    let (evicted_ino, (evicted_content, evicted_len, _)) = data.cache.pop_lru().unwrap();
-                    data.current_size -= evicted_len;
-                    // dirty_size is not affected since it was a clean file
-                    evicted.push((evicted_ino, evicted_content));
+                if !*lru_dirty {
+                    let (evicted_key, (evicted_data, _)) = data_lock.cache.pop_lru().unwrap();
+                    data_lock.current_size -= evicted_data.len() as u64;
+                    evicted.push((evicted_key, evicted_data));
                     evicted_one = true;
                 }
             }
 
             if !evicted_one {
-                break; // No more clean files to evict.
+                break;
             }
         }
 
-        if data.current_size + content_len > self.max_size {
+        if data_lock.current_size + block_len > self.max_size {
             return Err(libc::ENOSPC);
         }
 
-        if let Some((_old_content, old_len, old_dirty)) = data.cache.put(ino, (content.clone(), content_len, dirty)) {
-            data.current_size -= old_len;
+        if let Some((old_data, old_dirty)) = data_lock.cache.put((ino, block_index), (data, dirty)) {
+            data_lock.current_size -= old_data.len() as u64;
             if old_dirty {
-                data.dirty_size -= old_len;
+                data_lock.dirty_size -= old_data.len() as u64;
             }
         }
-        data.current_size += content_len;
+        data_lock.current_size += block_len;
         if dirty {
-            data.dirty_size += content_len;
+            data_lock.dirty_size += block_len;
         }
 
         self.cache_cond.notify_all();
         Ok(evicted)
     }
 
-    pub fn mark_as_clean(&self, ino: u64) {
+    pub fn get(&self, ino: u64, block_index: usize) -> Option<Vec<u8>> {
+        self.data
+            .lock()
+            .unwrap()
+            .cache
+            .get_mut(&(ino, block_index))
+            .map(|(data, _)| data.clone())
+    }
+
+    pub fn remove(&self, ino: u64, block_index: usize) {
         let mut data = self.data.lock().unwrap();
-        if let Some((_, len, is_dirty)) = data.cache.get_mut(&ino) {
+        if let Some((block_data, is_dirty)) = data.cache.pop(&(ino, block_index)) {
+            data.current_size -= block_data.len() as u64;
+            if is_dirty {
+                data.dirty_size -= block_data.len() as u64;
+            }
+        }
+    }
+
+    pub fn remove_file(&self, ino: u64) {
+        let mut data = self.data.lock().unwrap();
+        let keys_to_remove: Vec<(u64, usize)> = data
+            .cache
+            .iter()
+            .filter(|((entry_ino, _), _)| *entry_ino == ino)
+            .map(|(key, _)| *key)
+            .collect();
+
+        for key in keys_to_remove {
+            if let Some((block_data, is_dirty)) = data.cache.pop(&key) {
+                data.current_size -= block_data.len() as u64;
+                if is_dirty {
+                    data.dirty_size -= block_data.len() as u64;
+                }
+            }
+        }
+    }
+
+    pub fn mark_as_clean(&self, ino: u64, block_index: usize) {
+        let mut data = self.data.lock().unwrap();
+        if let Some((block_data, is_dirty)) = data.cache.get_mut(&(ino, block_index)) {
             if *is_dirty {
                 *is_dirty = false;
-                data.dirty_size -= *len;
+                data.dirty_size -= block_data.len() as u64;
             }
         }
     }
 
-    pub fn get(&self, ino: &u64) -> Option<Arc<RwLock<FileBlocks>>> {
-        self.data.lock().unwrap().cache.get_mut(ino).map(|(c, _, _)| c.clone())
-    }
-
-    pub fn remove(&self, ino: &u64) {
+    pub fn get_dirty_blocks_for_ino(&self, ino: u64) -> Vec<(usize, Vec<u8>)> {
+        let mut dirty_blocks = Vec::new();
         let mut data = self.data.lock().unwrap();
-        if let Some((_content, content_len, is_dirty)) = data.cache.pop(ino) {
-            data.current_size -= content_len;
-            if is_dirty {
-                data.dirty_size -= content_len;
+        for ((entry_ino, block_index), (block_data, is_dirty)) in data.cache.iter() {
+            if *entry_ino == ino && *is_dirty {
+                dirty_blocks.push((*block_index, block_data.clone()));
             }
         }
+        dirty_blocks
     }
 }

@@ -183,29 +183,20 @@ impl MirrorWorker {
                         file.dirty = false;
                         let regions = file.dirty_regions.regions().clone();
                         file.dirty_regions.clear();
-                        if let FileContent::InMemory(data) = &file.content {
-                            (Some(data.clone()), regions)
-                        } else {
-                            (None, regions)
-                        }
+                        (Some(file.blocks.clone()), regions)
                     } else {
                         return Ok(());
                     }
                 };
 
                 if let Some(data) = data_to_write {
-                    let data = data.read().unwrap();
-                    for (start, end) in regions {
-                        let start = start as u64;
-                        let end = end as u64;
-                        if end > data.length {
-                            continue;
-                        }
-                        let data_to_write = data.read(start, (end - start) as u32);
-                        mirror.write(ino, &data_to_write, start, &path_resolver)?;
+                    let dirty_blocks = lru_manager.get_dirty_blocks_for_ino(ino);
+                    for (block_index, block_data) in dirty_blocks {
+                        let offset = (block_index * data.read().unwrap().block_size) as u64;
+                        mirror.write(ino, &block_data, offset, &path_resolver)?;
+                        lru_manager.mark_as_clean(ino, block_index);
                     }
                 }
-                lru_manager.mark_as_clean(ino);
                 cache_cond.notify_all();
             }
             WriteJob::SetAttr { ino, attr } => {
@@ -262,6 +253,13 @@ pub trait Mirror: Debug {
     ) -> std::io::Result<Vec<MirrorDirEntry>>;
     fn read_link<'a>(&self, ino: u64, path_resolver: &PathResolver<'a>) -> std::io::Result<PathBuf>;
     fn read_file<'a>(&self, ino: u64, path_resolver: &PathResolver<'a>) -> std::io::Result<Vec<u8>>;
+    fn read_block<'a>(
+        &self,
+        ino: u64,
+        block_index: usize,
+        block_size: usize,
+        path_resolver: &PathResolver<'a>,
+    ) -> std::io::Result<Vec<u8>>;
     fn create_file<'a>(
         &self,
         ino: u64,
@@ -411,6 +409,23 @@ impl Mirror for LocalMirror {
         let path = path_resolver.resolve(ino)?;
         let fs_path = self.get_fs_path(&path);
         fs::read(fs_path)
+    }
+
+    fn read_block<'a>(
+        &self,
+        ino: u64,
+        block_index: usize,
+        block_size: usize,
+        path_resolver: &PathResolver<'a>,
+    ) -> std::io::Result<Vec<u8>> {
+        let path = path_resolver.resolve(ino)?;
+        let fs_path = self.get_fs_path(&path);
+        let file = fs::File::open(fs_path)?;
+        let mut buffer = vec![0; block_size];
+        let offset = (block_index * block_size) as u64;
+        let bytes_read = file.read_at(&mut buffer, offset)?;
+        buffer.truncate(bytes_read);
+        Ok(buffer)
     }
 
     fn create_file<'a>(

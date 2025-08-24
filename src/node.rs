@@ -58,8 +58,14 @@ impl Directory {
 pub const DEFAULT_BLOCK_SIZE: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
+pub enum Block {
+    InMemory(Vec<u8>),
+    Mirrored,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct FileBlocks {
-    pub blocks: Vec<Vec<u8>>,
+    pub blocks: Vec<Block>,
     pub block_size: usize,
     pub length: u64,
 }
@@ -73,10 +79,10 @@ impl FileBlocks {
         }
     }
 
-    pub fn read(&self, offset: u64, size: u32) -> Vec<u8> {
+    pub fn read(&self, offset: u64, size: u32) -> Result<Vec<u8>> {
         let mut data = Vec::with_capacity(size as usize);
         if offset >= self.length {
-            return data;
+            return Ok(data);
         }
 
         let mut remaining_size = std::cmp::min(size as u64, self.length - offset) as usize;
@@ -88,9 +94,17 @@ impl FileBlocks {
             let read_size = std::cmp::min(remaining_size, self.block_size - offset_in_block);
 
             if block_index < self.blocks.len() {
-                let block = &self.blocks[block_index];
-                let end = std::cmp::min(offset_in_block + read_size, block.len());
-                data.extend_from_slice(&block[offset_in_block..end]);
+                match &self.blocks[block_index] {
+                    Block::InMemory(block_data) => {
+                        let end = std::cmp::min(offset_in_block + read_size, block_data.len());
+                        data.extend_from_slice(&block_data[offset_in_block..end]);
+                    }
+                    Block::Mirrored => {
+                        // This indicates that the block needs to be fetched from the mirror.
+                        // The caller is responsible for handling this.
+                        return Err(EEXIST);
+                    }
+                }
             } else {
                 // Reading from a hole, which is all zeros
                 data.extend(std::iter::repeat(0).take(read_size));
@@ -98,7 +112,7 @@ impl FileBlocks {
             remaining_size -= read_size;
             current_offset += read_size as u64;
         }
-        data
+        Ok(data)
     }
 
     pub fn write(&mut self, offset: u64, new_data: &[u8]) {
@@ -109,7 +123,7 @@ impl FileBlocks {
 
         let num_blocks = (self.length as f64 / self.block_size as f64).ceil() as usize;
         if num_blocks > self.blocks.len() {
-            self.blocks.resize(num_blocks, Vec::new());
+            self.blocks.resize(num_blocks, Block::Mirrored);
         }
 
         let mut remaining_data = new_data;
@@ -121,12 +135,18 @@ impl FileBlocks {
             let write_size = std::cmp::min(remaining_data.len(), self.block_size - offset_in_block);
 
             let block = &mut self.blocks[block_index];
+            let mut block_data = match block {
+                Block::InMemory(data) => data.clone(),
+                Block::Mirrored => vec![0; self.block_size],
+            };
+
             let required_size = offset_in_block + write_size;
-            if block.len() < required_size {
-                block.resize(required_size, 0);
+            if block_data.len() < required_size {
+                block_data.resize(required_size, 0);
             }
-            block[offset_in_block..required_size]
+            block_data[offset_in_block..required_size]
                 .copy_from_slice(&remaining_data[..write_size]);
+            *block = Block::InMemory(block_data);
 
             remaining_data = &remaining_data[write_size..];
             current_offset += write_size as u64;
@@ -137,7 +157,7 @@ impl FileBlocks {
         self.length = size;
         let num_blocks = (self.length as f64 / self.block_size as f64).ceil() as usize;
         self.blocks.truncate(num_blocks);
-        if let Some(last_block) = self.blocks.last_mut() {
+        if let Some(Block::InMemory(last_block)) = self.blocks.last_mut() {
             let last_block_size = (self.length % self.block_size as u64) as usize;
             last_block.truncate(last_block_size);
         }
@@ -145,20 +165,8 @@ impl FileBlocks {
 }
 
 #[derive(Clone)]
-pub enum FileContent {
-    InMemory(Arc<RwLock<FileBlocks>>),
-    Mirrored,
-}
-
-impl FileContent {
-    pub fn is_ondisk(&self) -> bool {
-        matches!(self, FileContent::Mirrored)
-    }
-}
-
-#[derive(Clone)]
 pub struct File {
-    pub content: FileContent,
+    pub blocks: Arc<RwLock<FileBlocks>>,
     pub dirty: bool,
     pub dirty_regions: DirtyRegions,
 }
@@ -166,15 +174,21 @@ pub struct File {
 impl File {
     pub fn new(block_size: usize) -> Self {
         Self {
-            content: FileContent::InMemory(Arc::new(RwLock::new(FileBlocks::new(block_size)))),
+            blocks: Arc::new(RwLock::new(FileBlocks::new(block_size))),
             dirty: false,
             dirty_regions: DirtyRegions::new(),
         }
     }
 
-    pub fn new_on_disk() -> Self {
+    pub fn new_on_disk(length: u64, block_size: usize) -> Self {
+        let num_blocks = (length as f64 / block_size as f64).ceil() as usize;
+        let blocks = vec![Block::Mirrored; num_blocks];
         Self {
-            content: FileContent::Mirrored,
+            blocks: Arc::new(RwLock::new(FileBlocks {
+                blocks,
+                block_size,
+                length,
+            })),
             dirty: false,
             dirty_regions: DirtyRegions::new(),
         }
@@ -214,10 +228,10 @@ impl Node {
         }
     }
 
-    pub fn new_file_on_disk(attr: FileAttr) -> Self {
+    pub fn new_file_on_disk(attr: FileAttr, block_size: usize) -> Self {
         Self {
             attr,
-            kind: NodeKind::File(File::new_on_disk()),
+            kind: NodeKind::File(File::new_on_disk(attr.size, block_size)),
         }
     }
 

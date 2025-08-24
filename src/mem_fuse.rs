@@ -161,7 +161,7 @@ impl MemoryFuse {
             let new_node = if attr.kind == fuser::FileType::Directory {
                 Node::new_directory_on_disk(attr)
             } else if attr.kind == fuser::FileType::RegularFile {
-                Node::new_file_on_disk(attr)
+                Node::new_file_on_disk(attr, self.block_size)
             } else {
                 let path_resolver = PathResolver::new(nodes);
                 let target = mirror.read_link(original_ino, &path_resolver).unwrap();
@@ -233,13 +233,9 @@ impl MemoryFuse {
             let node = nodes.get_mut(ino)?;
             let mut attr_clone = node.attr;
             if let NodeKind::File(file) = &mut node.kind {
-                let d = match &mut file.content {
-                    FileContent::InMemory(data) => {
-                        self.lru_manager.get(&ino);
-                        Some(data.clone())
-                    }
-                    FileContent::Mirrored => None,
-                };
+                let d = Some(file.blocks.clone());
+                // This get is just to bump the file in the LRU
+                // self.lru_manager.get(&ino);
                 (d, attr_clone)
             } else {
                 // Not a file, handle other attributes
@@ -282,10 +278,13 @@ impl MemoryFuse {
         if let Some(flags) = flags { attr.flags = flags; }
 
         let evicted = if let Some(size) = size {
-            data.write().unwrap().truncate(size);
+            let mut file_blocks = data.write().unwrap();
+            file_blocks.truncate(size);
             attr.size = size;
-            self.lru_manager
-                .put(ino, data.clone(), self.mirror.is_some(), true)?
+            // This is a truncate, we don't need to put anything in the cache
+            // self.lru_manager
+            //     .put(ino, data.clone(), self.mirror.is_some(), true)?
+            Vec::new()
         } else {
             Vec::new()
         };
@@ -295,9 +294,6 @@ impl MemoryFuse {
         let old_size = node.attr.size;
         node.attr = attr;
         if let NodeKind::File(file) = &mut node.kind {
-            if file.content.is_ondisk() {
-                file.content = FileContent::InMemory(data.clone());
-            }
             if let Some(size) = size {
                 if size < old_size {
                     file.dirty_regions.truncate(size);
@@ -310,9 +306,12 @@ impl MemoryFuse {
         for (evicted_ino, evicted_content) in evicted {
             if let Ok(node) = nodes.get_mut(evicted_ino) {
                 if let NodeKind::File(file) = &mut node.kind {
-                    if let FileContent::InMemory(existing_content) = &file.content {
-                        if Arc::ptr_eq(&evicted_content, existing_content) {
-                            file.content = FileContent::Mirrored;
+                    if Arc::ptr_eq(&evicted_content, &file.blocks) {
+                        let file_blocks = file.blocks.read().unwrap();
+                        for (i, block) in file_blocks.blocks.iter().enumerate() {
+                            if let Block::InMemory(_) = block {
+                                self.lru_manager.remove(&(evicted_ino, i));
+                            }
                         }
                     }
                 }
@@ -481,7 +480,7 @@ impl MemoryFuse {
         };
 
         if nlink == 1 {
-            self.lru_manager.remove(&ino);
+            self.lru_manager.remove_file(ino);
         }
 
         let mut nodes = self.nodes.write().unwrap();
@@ -589,143 +588,121 @@ impl MemoryFuse {
     }
 
     pub(crate) fn read_file(&mut self, ino: u64, offset: i64, size: u32) -> Result<Vec<u8>> {
-        let content = {
+        let file_blocks_arc = {
             let nodes = self.nodes.read().unwrap();
             let node = nodes.get(ino)?;
             if let NodeKind::File(file) = &node.kind {
-                match &file.content {
-                    FileContent::InMemory(data) => {
-                        self.lru_manager.get(&ino);
-                        Some(data.clone())
-                    }
-                    FileContent::Mirrored => None,
-                }
+                Some(file.blocks.clone())
             } else {
                 return Err(ENOENT);
             }
         };
 
-        let data_arc = if let Some(content) = content {
-            content
-        } else {
-            let path_resolver = PathResolver::new(&self.nodes);
-            let new_data = self
-                .mirror
-                .as_ref()
-                .unwrap()
-                .read_file(ino, &path_resolver)
-                .unwrap_or_default();
-            let mut file_blocks = crate::node::FileBlocks::new(self.block_size);
-            file_blocks.write(0, &new_data);
-            let new_data_arc = Arc::new(RwLock::new(file_blocks));
+        let file_blocks_arc = file_blocks_arc.unwrap();
+        let mut file_blocks = file_blocks_arc.write().unwrap();
 
-            let evicted = self.lru_manager.put(
-                ino,
-                new_data_arc.clone(),
-                self.mirror.is_some(),
-                false,
-            )?;
-            let mut nodes = self.nodes.write().unwrap();
-            let node = nodes.get_mut(ino)?;
-            if let NodeKind::File(file) = &mut node.kind {
-                file.content = FileContent::InMemory(new_data_arc.clone());
-            }
-            for (evicted_ino, evicted_content) in evicted {
-                if let Ok(node) = nodes.get_mut(evicted_ino) {
-                    if let NodeKind::File(file) = &mut node.kind {
-                        if let FileContent::InMemory(existing_content) = &file.content {
-                            if Arc::ptr_eq(&evicted_content, existing_content) {
-                                file.content = FileContent::Mirrored;
+        let effective_offset = if offset < 0 {
+            max(0, file_blocks.length as i64 + offset) as u64
+        } else {
+            min(offset as u64, file_blocks.length)
+        };
+
+        let mut data = Vec::with_capacity(size as usize);
+        let mut remaining_size = std::cmp::min(size as u64, file_blocks.length - effective_offset) as usize;
+        let mut current_offset = effective_offset;
+
+        while remaining_size > 0 {
+            let block_index = (current_offset / file_blocks.block_size as u64) as usize;
+            let offset_in_block = (current_offset % file_blocks.block_size as u64) as usize;
+            let read_size = std::cmp::min(remaining_size, file_blocks.block_size - offset_in_block);
+
+            let block_data = if let Some(cached_block) = self.lru_manager.get(ino, block_index) {
+                cached_block
+            } else {
+                let block = &mut file_blocks.blocks[block_index];
+                match block {
+                    Block::InMemory(data) => data.clone(),
+                    Block::Mirrored => {
+                        let path_resolver = PathResolver::new(&self.nodes);
+                        let fetched_block = self
+                            .mirror
+                            .as_ref()
+                            .unwrap()
+                            .read_block(ino, block_index, file_blocks.block_size, &path_resolver)
+                            .unwrap_or_default();
+                        *block = Block::InMemory(fetched_block.clone());
+                        let evicted = self.lru_manager.put(ino, block_index, fetched_block.clone(), false)?;
+                        for ((evicted_ino, evicted_block_index), evicted_data) in evicted {
+                            if let Some(worker) = &self.mirror_worker {
+                                worker.sender().send(WriteJob::Write { ino: evicted_ino }).unwrap();
                             }
                         }
+                        fetched_block
                     }
                 }
-            }
-            new_data_arc
-        };
+            };
 
-        let data = data_arc.read().unwrap();
-        let effective_offset = if offset < 0 {
-            max(0, data.length as i64 + offset) as u64
-        } else {
-            min(offset as u64, data.length)
-        };
-        Ok(data.read(effective_offset, size))
+            let end = std::cmp::min(offset_in_block + read_size, block_data.len());
+            data.extend_from_slice(&block_data[offset_in_block..end]);
+
+            remaining_size -= read_size;
+            current_offset += read_size as u64;
+        }
+
+        Ok(data)
     }
 
     pub(crate) fn write_file(&mut self, ino: u64, offset: i64, new_data: &[u8]) -> Result<usize> {
-        let data_arc = {
+        let file_blocks_arc = {
             let mut nodes = self.nodes.write().unwrap();
             let node = nodes.get_mut(ino)?;
             if let NodeKind::File(file) = &mut node.kind {
-                match &mut file.content {
-                    FileContent::InMemory(data) => {
-                        self.lru_manager.get(&ino);
-                        Some(data.clone())
-                    }
-                    FileContent::Mirrored => None,
-                }
+                Some(file.blocks.clone())
             } else {
                 return Err(ENOENT);
             }
-        };
-
-        let data = if let Some(data_arc) = data_arc {
-            data_arc
-        } else {
-            let path_resolver = PathResolver::new(&self.nodes);
-            let initial_data = self
-                .mirror
-                .as_ref()
-                .unwrap()
-                .read_file(ino, &path_resolver)
-                .unwrap_or_default();
-            let mut file_blocks = crate::node::FileBlocks::new(self.block_size);
-            file_blocks.write(0, &initial_data);
-            Arc::new(RwLock::new(file_blocks))
-        };
+        }
+        .unwrap();
 
         let new_size;
         let effective_offset;
         {
-            let mut data_w = data.write().unwrap();
+            let mut file_blocks = file_blocks_arc.write().unwrap();
             effective_offset = if offset < 0 {
-                (data_w.length as i64 + offset) as u64
+                (file_blocks.length as i64 + offset) as u64
             } else {
                 offset as u64
             };
-            data_w.write(effective_offset, new_data);
-            new_size = data_w.length;
+            file_blocks.write(effective_offset, new_data);
+            new_size = file_blocks.length;
         }
 
-        let evicted = self.lru_manager.put(
-            ino,
-            data.clone(),
-            self.mirror.is_some(),
-            true,
-        )?;
+        let mut current_offset = effective_offset;
+        let mut remaining_data = new_data;
+        while !remaining_data.is_empty() {
+            let block_index = (current_offset / self.block_size as u64) as usize;
+            let write_size = std::cmp::min(remaining_data.len(), self.block_size);
+            let block_data = remaining_data[..write_size].to_vec();
+
+            let evicted = self.lru_manager
+                .put(ino, block_index, block_data, true)?;
+            for ((evicted_ino, _evicted_block_index), _evicted_data) in evicted {
+                if let Some(worker) = &self.mirror_worker {
+                    worker.sender().send(WriteJob::Write { ino: evicted_ino }).unwrap();
+                }
+            }
+
+            remaining_data = &remaining_data[write_size..];
+            current_offset += write_size as u64;
+        }
 
         let mut nodes = self.nodes.write().unwrap();
         let node = nodes.get_mut(ino)?;
         node.attr.size = new_size;
         if let NodeKind::File(file) = &mut node.kind {
-            if file.content.is_ondisk() {
-                file.content = FileContent::InMemory(data.clone());
-            }
             file.dirty = true;
             file.dirty_regions
                 .add_region(effective_offset, effective_offset + new_data.len() as u64);
-            for (evicted_ino, evicted_content) in evicted {
-                if let Ok(node) = nodes.get_mut(evicted_ino) {
-                    if let NodeKind::File(file) = &mut node.kind {
-                        if let FileContent::InMemory(existing_content) = &file.content {
-                            if Arc::ptr_eq(&evicted_content, existing_content) {
-                                file.content = FileContent::Mirrored;
-                            }
-                        }
-                    }
-                }
-            }
             if let Some(worker) = &self.mirror_worker {
                 worker.sender().send(WriteJob::Write { ino }).unwrap();
             }
