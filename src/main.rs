@@ -82,10 +82,4 @@ fn start_fuse(
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::node::FileBlocks;
-    include!("tests/mirror_tests.rs");
-    include!("tests/dirty_tests.rs");
-    include!("tests/lru_cache_tests.rs");
-    include!("tests/block_storage_tests.rs");
-}
+mod tests;
