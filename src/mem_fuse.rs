@@ -36,7 +36,7 @@ impl MemoryFuse {
         let nodes_arc = Arc::new(RwLock::new(Nodes::new()));
 
         let next_ino_atomic = AtomicUsize::new(2);
-        if lazy_load {
+        if lazy_load && mirror.is_some() {
             if let Some(mirror) = &mirror {
                 let root_attr = new_attr(
                     1,
