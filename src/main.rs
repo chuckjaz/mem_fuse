@@ -36,8 +36,8 @@ pub struct FuseCommand {
     #[arg(short, long)]
     /// The root node of the invariant files server, ignored otherwise
     root: Option<u64>,
-    /// The block size for files in Mb
-    #[arg(long, default_value_t = 1)]
+    /// The block size for files in Kb
+    #[arg(long, default_value_t = 1024)]
     block_size: usize,
 }
 
@@ -56,7 +56,7 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
         config.cache_max_write_size * 1024 * 1024,
         config.lazy_load,
         config.root,
-        config.block_size * 1024 * 1024,
+        config.block_size * 1024,
     )?;
 
     Ok(())
