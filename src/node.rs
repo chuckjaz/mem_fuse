@@ -147,12 +147,12 @@ impl FileBlocks {
 #[derive(Clone)]
 pub enum FileContent {
     InMemory(Arc<RwLock<FileBlocks>>),
-    OnDisk,
+    Mirrored,
 }
 
 impl FileContent {
     pub fn is_ondisk(&self) -> bool {
-        matches!(self, FileContent::OnDisk)
+        matches!(self, FileContent::Mirrored)
     }
 }
 
@@ -174,7 +174,7 @@ impl File {
 
     pub fn new_on_disk() -> Self {
         Self {
-            content: FileContent::OnDisk,
+            content: FileContent::Mirrored,
             dirty: false,
             dirty_regions: DirtyRegions::new(),
         }
@@ -184,12 +184,12 @@ impl File {
 #[derive(Clone)]
 pub enum DirectoryKind {
     InMemory(Directory),
-    OnDisk,
+    Mirrored,
 }
 
 impl DirectoryKind {
     pub fn is_ondisk(&self) -> bool {
-        matches!(self, DirectoryKind::OnDisk)
+        matches!(self, DirectoryKind::Mirrored)
     }
 }
 
@@ -231,7 +231,7 @@ impl Node {
     pub fn new_directory_on_disk(attr: FileAttr) -> Self {
         Self {
             attr,
-            kind: NodeKind::Directory(DirectoryKind::OnDisk),
+            kind: NodeKind::Directory(DirectoryKind::Mirrored),
         }
     }
 
@@ -256,7 +256,7 @@ impl Node {
         self.accessed();
         match &self.kind {
             NodeKind::Directory(DirectoryKind::InMemory(dir)) => Ok(dir),
-            NodeKind::Directory(DirectoryKind::OnDisk) => Err(EEXIST),
+            NodeKind::Directory(DirectoryKind::Mirrored) => Err(EEXIST),
             _ => Err(ENOTDIR),
         }
     }
@@ -265,7 +265,7 @@ impl Node {
         self.written();
         match &mut self.kind {
             NodeKind::Directory(DirectoryKind::InMemory(dir)) => Ok(dir),
-            NodeKind::Directory(DirectoryKind::OnDisk) => Err(EEXIST),
+            NodeKind::Directory(DirectoryKind::Mirrored) => Err(EEXIST),
             _ => Err(ENOTDIR),
         }
     }

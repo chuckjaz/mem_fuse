@@ -238,7 +238,7 @@ impl MemoryFuse {
                         self.lru_manager.get(&ino);
                         Some(data.clone())
                     }
-                    FileContent::OnDisk => None,
+                    FileContent::Mirrored => None,
                 };
                 (d, attr_clone)
             } else {
@@ -312,7 +312,7 @@ impl MemoryFuse {
                 if let NodeKind::File(file) = &mut node.kind {
                     if let FileContent::InMemory(existing_content) = &file.content {
                         if Arc::ptr_eq(&evicted_content, existing_content) {
-                            file.content = FileContent::OnDisk;
+                            file.content = FileContent::Mirrored;
                         }
                     }
                 }
@@ -598,7 +598,7 @@ impl MemoryFuse {
                         self.lru_manager.get(&ino);
                         Some(data.clone())
                     }
-                    FileContent::OnDisk => None,
+                    FileContent::Mirrored => None,
                 }
             } else {
                 return Err(ENOENT);
@@ -635,7 +635,7 @@ impl MemoryFuse {
                     if let NodeKind::File(file) = &mut node.kind {
                         if let FileContent::InMemory(existing_content) = &file.content {
                             if Arc::ptr_eq(&evicted_content, existing_content) {
-                                file.content = FileContent::OnDisk;
+                                file.content = FileContent::Mirrored;
                             }
                         }
                     }
@@ -663,7 +663,7 @@ impl MemoryFuse {
                         self.lru_manager.get(&ino);
                         Some(data.clone())
                     }
-                    FileContent::OnDisk => None,
+                    FileContent::Mirrored => None,
                 }
             } else {
                 return Err(ENOENT);
@@ -720,7 +720,7 @@ impl MemoryFuse {
                     if let NodeKind::File(file) = &mut node.kind {
                         if let FileContent::InMemory(existing_content) = &file.content {
                             if Arc::ptr_eq(&evicted_content, existing_content) {
-                                file.content = FileContent::OnDisk;
+                                file.content = FileContent::Mirrored;
                             }
                         }
                     }

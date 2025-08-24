@@ -191,7 +191,7 @@ fn test_lru_eviction() {
 
         let node2 = nodes.get(file2_ino).unwrap();
         if let NodeKind::File(file) = &node2.kind {
-            assert!(matches!(file.content, FileContent::OnDisk));
+            assert!(matches!(file.content, FileContent::Mirrored));
         } else {
             panic!("Node2 is not a file");
         }
