@@ -1,3 +1,5 @@
+use crate::node::FileBlocks;
+
 #[test]
 fn test_write_read_single_block() {
     let mut file_blocks = FileBlocks::new(1024);

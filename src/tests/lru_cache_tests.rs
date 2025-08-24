@@ -1,4 +1,5 @@
 use crate::lru_cache::LruManager;
+use crate::node::FileBlocks;
 
 fn create_file_blocks(data: &[u8]) -> FileBlocks {
     let mut file_blocks = FileBlocks::new(1024);
