@@ -1,6 +1,6 @@
 # mem-fuse
 
-An in-memory FUSE filesystem written in Rust.
+An in-memory FUSE filesystem written in Rust. That can be mirrored locally or in an invariant files service.
 
 ## Description
 
