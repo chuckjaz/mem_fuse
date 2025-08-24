@@ -54,6 +54,7 @@ impl Directory {
     }
 }
 
+#[cfg(test)]
 pub const DEFAULT_BLOCK_SIZE: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
