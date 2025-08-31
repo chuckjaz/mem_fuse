@@ -4,11 +4,13 @@ use std::path::Path;
 use std::thread::sleep;
 use std::time::Duration;
 use tempfile::tempdir;
-use crate::mem_fuse::{MemoryFuse};
+use users::{get_current_gid, get_current_uid};
+use crate::mem_fuse::MemoryFuse;
 use crate::mirror::LocalMirror;
-use crate::node::{NodeKind, FileContent};
+use crate::node::NodeKind;
 use std::ffi::OsStr;
 use std::sync::Arc;
+use ntest::timeout;
 
 fn wait_for_path(path: &Path, should_exist: bool) {
     for _ in 0..30 {
@@ -25,6 +27,7 @@ fn wait_for_path(path: &Path, should_exist: bool) {
 }
 
 #[test]
+#[timeout(1000)]
 fn test_disk_mirroring() {
     let dir = tempdir().unwrap();
     let image_path = dir.path().to_path_buf();
@@ -49,9 +52,6 @@ fn test_disk_mirroring() {
     assert!(on_disk_dir_path.is_dir());
     let metadata = on_disk_dir_path.metadata().unwrap();
     assert_eq!(metadata.mode() & 0o777, 0o755);
-    // Note: UID/GID checks might fail if not run as root
-    // assert_eq!(metadata.uid(), 1001);
-    // assert_eq!(metadata.gid(), 1002);
 
     // 2. Create a file inside the directory
     let file_name = OsStr::new("test.txt");
@@ -64,8 +64,6 @@ fn test_disk_mirroring() {
     wait_for_path(&on_disk_file_path, true);
     let metadata = on_disk_file_path.metadata().unwrap();
     assert_eq!(metadata.mode() & 0o777, 0o644);
-    // assert_eq!(metadata.uid(), 1003);
-    // assert_eq!(metadata.gid(), 1004);
 
     // 3. Write to the file
     let data = b"hello world";
@@ -84,7 +82,8 @@ fn test_disk_mirroring() {
         let nodes = fuse.nodes.read().unwrap();
         let node = nodes.get(file_ino).unwrap();
         if let NodeKind::File(file) = &node.kind {
-            assert!(matches!(file.content, FileContent::InMemory(_)));
+            let blocks = file.blocks.read().unwrap();
+            assert_eq!(blocks.any_mirrored(0, blocks.size), false);
         } else {
             panic!("Node is not a file");
         }
@@ -123,6 +122,7 @@ fn test_disk_mirroring() {
 }
 
 #[test]
+#[timeout(1000)]
 fn test_lru_eviction() {
     let dir = tempdir().unwrap();
     let image_path = dir.path().to_path_buf();
@@ -141,34 +141,33 @@ fn test_lru_eviction() {
     let file1_attr = fuse.make_file(1, file1_name, 0o644, 1000, 1000).unwrap();
     let file1_ino = file1_attr.ino;
     let data1 = vec![1u8; 600 * 1024];
-    fuse.write_file(file1_ino, 0, &data1).unwrap();
+    assert!(fuse.write_file(file1_ino, 0, &data1).is_ok());
 
     // Create file 2 (0.6 MB)
     let file2_name = OsStr::new("file2.txt");
     let file2_attr = fuse.make_file(1, file2_name, 0o644, 1000, 1000).unwrap();
     let file2_ino = file2_attr.ino;
     let data2 = vec![2u8; 600 * 1024];
-    fuse.write_file(file2_ino, 0, &data2).unwrap();
+    assert!(fuse.write_file(file2_ino, 0, &data2).is_ok());
 
     // At this point, file1 should be evicted.
     // The total size is 1.2MB, which is > 1MB.
-
-    // Wait for writes to complete
-    sleep(Duration::from_secs(2));
+    fuse.flush_mirror();
 
     {
         let nodes = fuse.nodes.read().unwrap();
         let node1 = nodes.get(file1_ino).unwrap();
-        if let NodeKind::File(_file) = &node1.kind {
-            // This might not be OnDisk if the worker thread is slow.
-            // A better check is to see if we can load a third file.
+        if let NodeKind::File(file) = &node1.kind {
+            let blocks = file.blocks.read().unwrap();
+            assert!(blocks.any_mirrored(0, blocks.size))
         } else {
             panic!("Node1 is not a file");
         }
 
         let node2 = nodes.get(file2_ino).unwrap();
         if let NodeKind::File(file) = &node2.kind {
-            assert!(matches!(file.content, FileContent::InMemory(_)));
+            let blocks = file.blocks.read().unwrap();
+            assert!(!blocks.any_mirrored(0, blocks.size));
         } else {
             panic!("Node2 is not a file");
         }
@@ -177,21 +176,22 @@ fn test_lru_eviction() {
     // Access file1 again to bring it back to memory
     fuse.read_file(file1_ino, 0, 1).unwrap();
 
-    // Now file2 should be evicted
-    sleep(Duration::from_secs(2));
+    fuse.flush_mirror();
 
     {
         let nodes = fuse.nodes.read().unwrap();
         let node1 = nodes.get(file1_ino).unwrap();
         if let NodeKind::File(file) = &node1.kind {
-            assert!(matches!(file.content, FileContent::InMemory(_)));
+            let blocks = file.blocks.read().unwrap();
+            assert!(!blocks.any_mirrored(0, blocks.size))
         } else {
             panic!("Node1 is not a file");
         }
 
         let node2 = nodes.get(file2_ino).unwrap();
         if let NodeKind::File(file) = &node2.kind {
-            assert!(matches!(file.content, FileContent::Mirrored));
+            let blocks = file.blocks.read().unwrap();
+            assert!(blocks.any_mirrored(0, blocks.size))
         } else {
             panic!("Node2 is not a file");
         }
@@ -224,6 +224,7 @@ fn test_lru_eviction_dirty() {
 }
 
 #[test]
+#[timeout(1000)]
 fn test_lazy_load() {
     let dir = tempdir().unwrap();
     let image_path = dir.path().to_path_buf();
@@ -284,4 +285,29 @@ fn test_lazy_load() {
     let file_attr = entries[0].1;
     let data = fuse.read_file(file_attr.ino, 0, 1024).unwrap();
     assert_eq!(data, b"hello");
+}
+
+#[test]
+#[timeout(2000)]
+fn test_large_file_with_default_size() {
+    let dir = tempdir().unwrap();
+    let image_path = dir.path().to_path_buf();
+    let uid = get_current_uid();
+    let gid = get_current_gid();
+    let mirror = LocalMirror::new(image_path.clone());
+    let mut fuse = MemoryFuse::new(
+        Some(Arc::new(mirror)),
+        10 * 1024 * 1024,
+        10 * 1024 * 1024,
+        true,
+        crate::node::DEFAULT_BLOCK_SIZE,
+    );
+
+    let file_name = OsStr::new("test.txt");
+    let ino = fuse.make_file(1, file_name, 0o755, uid, gid).unwrap().ino;
+    let data = [1u8; 100 * 1024];
+    let len = data.len() as u64;
+    for index in 0..1024u64 {
+        fuse.write_file(ino, (index * len) as i64, &data[..]).unwrap();
+    }
 }

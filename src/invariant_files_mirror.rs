@@ -238,17 +238,26 @@ impl Mirror for InvariantFilesMirror {
         }
     }
 
-    fn read_file<'a>(&self, ino: u64, _path_resolver: &PathResolver<'a>) -> std::io::Result<Vec<u8>> {
+    fn read<'a>(
+        &self,
+        ino: u64,
+        data: &mut [u8],
+        offset: u64,
+        _path_resolver: &PathResolver<'a>
+    ) -> std::io::Result<usize> {
         let remote_ino = self.get_remote_ino(ino);
-        let url = self.get_url(&format!("files/{remote_ino}"));
+        let url = self.get_url(&format!("files/{remote_ino}?offset={offset}&length={}", data.len()));
         let response = self.client.get(url).send().map_err(to_io_error)?;
         if !response.status().is_success() {
             return Err(io::Error::new(
                 ErrorKind::Other,
-                format!("Failed to read file: {}", response.status()),
+                format!("Failed to read file: {}", response.status())
             ));
-        }
-        Ok(response.bytes().map_err(to_io_error)?.to_vec())
+        };
+        let bytes = response.bytes().map_err(to_io_error)?;
+        let result = bytes.len();
+        data.copy_from_slice(&bytes[0..result]);
+        Ok(result)
     }
 
     fn create_file<'a>(

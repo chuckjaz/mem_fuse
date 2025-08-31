@@ -57,30 +57,11 @@ fn test_add_region_invalid() {
 }
 
 #[test]
-fn test_clear() {
+fn test_remove() {
     let mut regions = DirtyRegions::new();
     regions.add_region(0, 10);
     regions.add_region(20, 30);
-    regions.clear();
-    assert!(regions.regions().is_empty());
-}
-
-#[test]
-fn test_truncate() {
-    let mut regions = DirtyRegions::new();
-    regions.add_region(0, 10);
-    regions.add_region(20, 30);
-    regions.add_region(40, 50);
-
-    regions.truncate(25);
-    assert_eq!(regions.regions().len(), 2);
-    assert!(regions.regions().contains(&(0, 10)));
-    assert!(regions.regions().contains(&(20, 25)));
-
-    regions.truncate(5);
-    assert_eq!(regions.regions().len(), 1);
-    assert!(regions.regions().contains(&(0, 5)));
-
-    regions.truncate(0);
+    regions.remove_region(0, 10);
+    regions.remove_region(20, 30);
     assert!(regions.regions().is_empty());
 }

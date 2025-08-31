@@ -1,10 +1,29 @@
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex};
 use lru::LruCache;
 use libc;
-use crate::node::FileBlocks;
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct BlockAddress {
+    ino: u64,
+    block: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BlockEntry {
+    version: usize,
+    block_size: usize,
+    is_dirty: bool
+}
+
+#[derive(Debug)]
+pub struct BlockEviction {
+    pub ino: u64,
+    pub block: usize,
+    pub version: usize,
+}
 
 struct CacheData {
-    cache: LruCache<u64, (Arc<RwLock<FileBlocks>>, u64, bool)>, // content, len, is_dirty
+    cache: LruCache<BlockAddress, BlockEntry>,
     current_size: u64,
     dirty_size: u64,
 }
@@ -30,17 +49,22 @@ impl LruManager {
         }
     }
 
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.data.lock().unwrap().cache.is_empty()
+    }
+
     pub fn put(
         &self,
         ino: u64,
-        content: Arc<RwLock<FileBlocks>>,
+        block: usize,
+        block_size: usize,
+        version: usize,
         has_mirror: bool,
-        dirty: bool,
-    ) -> Result<Vec<(u64, Arc<RwLock<FileBlocks>>)>, libc::c_int> {
-        let content_len = content.read().unwrap().length;
+        is_dirty: bool,
+    ) -> Result<Vec<BlockEviction>, libc::c_int> {
+        let new_dirty_len = if is_dirty { block_size as u64 } else { 0 };
         let mut data = self.data.lock().unwrap();
-
-        let new_dirty_len = if dirty { content_len } else { 0 };
         if data.dirty_size + new_dirty_len > self.max_write_size {
             if has_mirror {
                 while data.dirty_size + new_dirty_len > self.max_write_size {
@@ -52,68 +76,96 @@ impl LruManager {
         }
 
         let mut evicted = Vec::new();
-        while data.current_size + content_len > self.max_size {
-            let mut evicted_one = false;
-            if let Some((lru_ino, ( _, _, lru_dirty))) = data.cache.peek_lru() {
-                if *lru_ino == ino {
-                    // This can happen if we are updating an existing file that is also the LRU one.
-                    // We should not evict it in this case.
-                    break;
+        if data.current_size  + block_size as u64 > self.max_size {
+            let mut evicted_size = 0u64;
+
+            for (block_address, block_entry) in data.cache.iter().rev() {
+                if !block_entry.is_dirty {
+                    evicted.push(BlockEviction {
+                        ino: block_address.ino,
+                        block: block_address.block,
+                        version: block_entry.version,
+                    });
+                    evicted_size += block_entry.block_size as u64;
+                    if (data.current_size - evicted_size) + block_size as u64 <= self.max_size {
+                        break
+                    }
                 }
-                if !lru_dirty {
-                    let (evicted_ino, (evicted_content, evicted_len, _)) = data.cache.pop_lru().unwrap();
-                    data.current_size -= evicted_len;
-                    // dirty_size is not affected since it was a clean file
-                    evicted.push((evicted_ino, evicted_content));
-                    evicted_one = true;
-                }
             }
 
-            if !evicted_one {
-                break; // No more clean files to evict.
+            // If we still don't have enough room we are out of space.
+            if (data.current_size - evicted_size) + block_size as u64 > self.max_size {
+                // Restore the previous current size as we are not going to evict the blocks we found.
+                return Err(libc::ENOSPC);
             }
+
+            // Remove evicted blocks
+            for eviction in &evicted {
+                let block_address = BlockAddress { ino: eviction.ino, block:eviction.block };
+                data.cache.pop_entry(&block_address);
+            }
+
+            data.current_size -= evicted_size;
         }
 
-        if data.current_size + content_len > self.max_size {
-            return Err(libc::ENOSPC);
-        }
-
-        if let Some((_old_content, old_len, old_dirty)) = data.cache.put(ino, (content.clone(), content_len, dirty)) {
-            data.current_size -= old_len;
-            if old_dirty {
-                data.dirty_size -= old_len;
+        // Record the space (maybe update the existing entry)
+        let block_address = BlockAddress { ino, block };
+        let block_entry = BlockEntry { version, block_size, is_dirty };
+        if let Some(old_entry) = data.cache.put(block_address, block_entry) {
+            data.current_size -= old_entry.block_size as u64;
+            if old_entry.is_dirty {
+                data.dirty_size -= old_entry.block_size as u64;
             }
         }
-        data.current_size += content_len;
-        if dirty {
-            data.dirty_size += content_len;
+        data.current_size += block_size as u64;
+        if is_dirty {
+            data.dirty_size += block_size as u64;
         }
 
         self.cache_cond.notify_all();
         Ok(evicted)
     }
 
-    pub fn mark_as_clean(&self, ino: u64) {
+    pub fn update_version(
+        &self,
+        ino: u64,
+        block_index: usize,
+        version: usize,
+    ) {
         let mut data = self.data.lock().unwrap();
-        if let Some((_, len, is_dirty)) = data.cache.get_mut(&ino) {
-            if *is_dirty {
-                *is_dirty = false;
-                data.dirty_size -= *len;
-            }
+        let block_address = BlockAddress { ino, block: block_index };
+        if let Some(current) = data.cache.get_mut(&block_address) {
+            current.version = version;
         }
     }
 
-    pub fn get(&self, ino: &u64) -> Option<Arc<RwLock<FileBlocks>>> {
-        self.data.lock().unwrap().cache.get_mut(ino).map(|(c, _, _)| c.clone())
+    pub fn mark_as_clean(&self, ino: u64, block: usize) {
+        let mut data = self.data.lock().unwrap();
+        let block_address = BlockAddress { ino, block };
+        if let Some(entry) = data.cache.get_mut(&block_address) {
+            if entry.is_dirty {
+                entry.is_dirty = false;
+                data.dirty_size -= entry.block_size as u64;
+            }
+        }
+        self.cache_cond.notify_all();
     }
 
-    pub fn remove(&self, ino: &u64) {
+    pub fn promote(&self, ino: u64, block: usize) {
+        let block_address = BlockAddress { ino, block };
         let mut data = self.data.lock().unwrap();
-        if let Some((_content, content_len, is_dirty)) = data.cache.pop(ino) {
-            data.current_size -= content_len;
-            if is_dirty {
-                data.dirty_size -= content_len;
+        data.cache.promote(&block_address);
+    }
+
+    pub fn remove(&self, ino: u64, block: usize) {
+        let block_address = BlockAddress { ino, block };
+        let mut data = self.data.lock().unwrap();
+        if let Some(entry) = data.cache.pop(&block_address) {
+            data.current_size -= entry.block_size as u64;
+            if entry.is_dirty {
+                data.dirty_size -= entry.block_size as u64;
             }
+            self.cache_cond.notify_all();
         }
     }
 }

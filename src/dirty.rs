@@ -32,21 +32,21 @@ impl DirtyRegions {
         self.regions = new_regions;
     }
 
+    pub fn is_dirty(&self, start: u64, end: u64) -> bool {
+        for (dirty_start, dirty_end) in self.regions.iter() {
+            if end <= *dirty_start { return false }
+            if start < *dirty_start && end >= *dirty_end { return true }
+            if start >= *dirty_start && start < *dirty_end { return true }
+            if end > *dirty_start && end <= *dirty_end { return true }
+        }
+        return false
+    }
+
     pub fn regions(&self) -> &BTreeSet<(u64, u64)> {
         &self.regions
     }
 
-    pub fn clear(&mut self) {
-        self.regions.clear();
-    }
-
-    pub fn truncate(&mut self, size: u64) {
-        let mut new_regions = BTreeSet::new();
-        for &(start, end) in self.regions.iter() {
-            if start < size {
-                new_regions.insert((start, end.min(size)));
-            }
-        }
-        self.regions = new_regions;
+    pub fn remove_region(&mut self, start: u64, end: u64) {
+        let _ = self.regions.remove(&(start, end));
     }
 }

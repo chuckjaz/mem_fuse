@@ -1,9 +1,5 @@
 use std::{
-    collections::HashMap,
-    ffi::{OsStr, OsString},
-    path::{Path, PathBuf},
-    sync::{Arc, RwLock},
-    time::SystemTime,
+    cmp::min, collections::HashMap, ffi::{OsStr, OsString}, path::{Path, PathBuf}, sync::{Arc, RwLock}, time::SystemTime
 };
 
 use fuser::FileAttr;
@@ -58,10 +54,69 @@ impl Directory {
 pub const DEFAULT_BLOCK_SIZE: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct Block {
+    data: Vec<u8>,
+    version: usize
+}
+
+impl Block {
+    fn new(size: usize) -> Self {
+        let mut data = Vec::new();
+        data.resize(size, 0u8);
+        Self { data, version: 1 }
+    }
+
+    fn new_version(&mut self) {
+        self.version += 1;
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum FileBlock {
+    InMemory(Block),
+    Mirrored,
+}
+
+impl FileBlock {
+    fn new_in_memory(size: usize) -> FileBlock {
+        Self::InMemory(Block::new(size))
+    }
+
+    fn is_mirrored(&self) -> bool {
+        if let FileBlock::Mirrored = self { true } else { false }
+    }
+
+    fn unwrap_vec(&self) -> &Vec<u8> {
+        if let FileBlock::InMemory(block) = self {
+            &block.data
+        } else {
+            panic!("Unexpected Mirrored block")
+        }
+    }
+
+    fn unwrap_vec_mut(&mut self) -> &mut Vec<u8> {
+        if let FileBlock::InMemory(block) = self {
+            block.new_version();
+            &mut block.data
+        } else {
+            panic!("Unexpected Mirrored block")
+        }
+    }
+
+    fn version(&self) -> usize {
+        match self {
+            FileBlock::InMemory(block) => block.version,
+            FileBlock::Mirrored => 0
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct FileBlocks {
-    pub blocks: Vec<Vec<u8>>,
+    pub blocks: Vec<FileBlock>,
     pub block_size: usize,
-    pub length: u64,
+    pub size: u64,
+    pub dirty_regions: DirtyRegions,
 }
 
 impl FileBlocks {
@@ -69,114 +124,165 @@ impl FileBlocks {
         Self {
             blocks: Vec::new(),
             block_size,
-            length: 0,
+            size: 0,
+            dirty_regions: DirtyRegions::new(),
         }
     }
 
-    pub fn read(&self, offset: u64, size: u32) -> Vec<u8> {
-        let mut data = Vec::with_capacity(size as usize);
-        if offset >= self.length {
-            return data;
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    pub fn is_mirrored(&self, block_index: usize) -> bool {
+        if block_index >= self.blocks.len() {
+            panic!("Indexing past the last block")
         }
+        if let FileBlock::Mirrored = self.blocks[block_index] { true } else { false }
+    }
 
-        let mut remaining_size = std::cmp::min(size as u64, self.length - offset) as usize;
-        let mut current_offset = offset;
+    pub fn any_mirrored(&self, start: u64, end: u64) -> bool {
+        for (_, block_index, _, _) in block_ranges(start, end, self.block_size) {
+            if self.is_mirrored(block_index) {
+                return true
+            }
+        }
+        false
+    }
 
-        while remaining_size > 0 {
-            let block_index = (current_offset / self.block_size as u64) as usize;
-            let offset_in_block = (current_offset % self.block_size as u64) as usize;
-            let read_size = std::cmp::min(remaining_size, self.block_size - offset_in_block);
+    pub fn get_block(&self, block_index: usize) -> &Vec<u8> {
+        if block_index >= self.blocks.len() {
+            panic!("Indexing past the last block")
+        }
+        self.blocks[block_index].unwrap_vec()
+    }
 
-            if block_index < self.blocks.len() {
-                let block = &self.blocks[block_index];
-                let end = std::cmp::min(offset_in_block + read_size, block.len());
-                data.extend_from_slice(&block[offset_in_block..end]);
+    pub fn get_block_mut(&mut self, block_index: usize) -> &mut Vec<u8> {
+        if block_index >= self.blocks.len() {
+            panic!("Indexing past the last block")
+        }
+        let blocks = &mut self.blocks;
+        let blocks_len = blocks.len();
+        let block = &mut blocks[block_index];
+        if block.is_mirrored() {
+            if block_index == blocks_len - 1 && self.size % (self.block_size as u64) != 0 {
+                let last_block_size = (self.size % self.block_size as u64) as usize;
+                *block = FileBlock::new_in_memory(last_block_size);
             } else {
-                // Reading from a hole, which is all zeros
-                data.extend(std::iter::repeat(0).take(read_size));
+                *block = FileBlock::new_in_memory(self.block_size);
             }
-            remaining_size -= read_size;
-            current_offset += read_size as u64;
         }
-        data
+        block.unwrap_vec_mut()
     }
 
-    pub fn write(&mut self, offset: u64, new_data: &[u8]) {
-        let new_length = offset + new_data.len() as u64;
-        if new_length > self.length {
-            self.length = new_length;
+    pub fn version(&self, block_index: usize) -> usize {
+        if block_index >= self.blocks.len() {
+            panic!("Indexing past the last block")
         }
-
-        let num_blocks = (self.length as f64 / self.block_size as f64).ceil() as usize;
-        if num_blocks > self.blocks.len() {
-            self.blocks.resize(num_blocks, Vec::new());
-        }
-
-        let mut remaining_data = new_data;
-        let mut current_offset = offset;
-
-        while !remaining_data.is_empty() {
-            let block_index = (current_offset / self.block_size as u64) as usize;
-            let offset_in_block = (current_offset % self.block_size as u64) as usize;
-            let write_size = std::cmp::min(remaining_data.len(), self.block_size - offset_in_block);
-
-            let block = &mut self.blocks[block_index];
-            let required_size = offset_in_block + write_size;
-            if block.len() < required_size {
-                block.resize(required_size, 0);
-            }
-            block[offset_in_block..required_size]
-                .copy_from_slice(&remaining_data[..write_size]);
-
-            remaining_data = &remaining_data[write_size..];
-            current_offset += write_size as u64;
-        }
+        self.blocks[block_index].version()
     }
 
-    pub fn truncate(&mut self, size: u64) {
-        self.length = size;
-        let num_blocks = (self.length as f64 / self.block_size as f64).ceil() as usize;
+    pub fn extend_to(&mut self, len: u64) {
+        let blocks_needed = (len as f64 / self.block_size as f64).ceil() as usize;
+        let last_block_index = (self.size / self.block_size as u64) as usize;
+        if self.blocks.len() < blocks_needed {
+            if last_block_index < self.blocks.len() && !self.blocks[last_block_index].is_mirrored() {
+                self.blocks[last_block_index].unwrap_vec_mut().resize(self.block_size, 0u8)
+            }
+            self.blocks.resize(blocks_needed, FileBlock::Mirrored);
+        } else if self.blocks.len() == blocks_needed && blocks_needed != 0 {
+            if !self.blocks[last_block_index].is_mirrored() {
+                let new_last_block_size = {
+                    let size = (len % self.block_size as u64) as usize;
+                    if size == 0usize { self.block_size } else { size }
+                };
+                self.blocks[last_block_index].unwrap_vec_mut().resize(new_last_block_size, 0u8);
+            }
+        }
+        self.size = len;
+    }
+
+    pub fn truncate_to(&mut self, size: u64) -> usize {
+        self.size = size;
+        let num_blocks = self.required_blocks_for(size);
         self.blocks.truncate(num_blocks);
+        let last_block_size = (self.size % self.block_size as u64) as usize;
         if let Some(last_block) = self.blocks.last_mut() {
-            let last_block_size = (self.length % self.block_size as u64) as usize;
-            last_block.truncate(last_block_size);
+            let vec = last_block.unwrap_vec_mut();
+            vec.truncate(last_block_size);
+        }
+        last_block_size
+    }
+
+    pub fn required_blocks_for(&self, size: u64) -> usize {
+        (size as f64 / self.block_size as f64).ceil() as usize
+    }
+
+    pub fn evict_version(&mut self, block_index: usize, version: usize) {
+        if block_index >= self.blocks.len() {
+            // Ignore this as this may be an old request
+            return;
+        }
+
+        // Only evict if it is still the version we wanted evicted.
+        // If not it may have been resurrected by a write so ignore it as the write may still
+        // need the buffer.
+        if self.version(block_index) == version {
+            self.blocks[block_index] = FileBlock::Mirrored
+        }
+    }
+
+    pub fn size_of_block(&self, block_index: usize) -> usize {
+        if block_index == self.len() - 1 {
+            (self.size % (self.block_size as u64)) as usize
+        } else {
+            self.block_size
         }
     }
 }
 
-#[derive(Clone)]
-pub enum FileContent {
-    InMemory(Arc<RwLock<FileBlocks>>),
-    Mirrored,
+struct BlockIter {
+    current: u64,
+    end: u64,
+    block_size: usize,
 }
 
-impl FileContent {
-    pub fn is_ondisk(&self) -> bool {
-        matches!(self, FileContent::Mirrored)
+impl Iterator for BlockIter {
+    type Item = (u64, usize, usize, usize);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current >= self.end { return None };
+        let current = self.current;
+        let block_start = (current % self.block_size as u64) as usize;
+        let block_end = min(self.block_size, block_start + (self.end - self.current) as usize);
+        let block_index = (current / self.block_size as u64) as usize;
+        if block_start > block_end {
+            let end = self.end;
+            panic!("Something is wrong, current: {current}, end: {end}, block_start: {block_start}, block_end: {block_end}");
+        }
+        self.current += (block_end - block_start) as u64;
+        if block_start == block_end {
+            None
+        } else {
+            Some((current, block_index, block_start, block_end))
+        }
     }
+}
+
+pub fn block_ranges(start: u64, end: u64, block_size: usize) -> impl Iterator<Item = (u64, usize, usize, usize)> {
+    BlockIter { current: start, end, block_size }
 }
 
 #[derive(Clone)]
 pub struct File {
-    pub content: FileContent,
-    pub dirty: bool,
-    pub dirty_regions: DirtyRegions,
+    pub blocks: Arc<RwLock<FileBlocks>>,
 }
 
 impl File {
-    pub fn new(block_size: usize) -> Self {
+    pub fn new(block_size: usize, size: u64) -> Self {
+        let mut blocks_inner = FileBlocks::new(block_size);
+        blocks_inner.extend_to(size);
         Self {
-            content: FileContent::InMemory(Arc::new(RwLock::new(FileBlocks::new(block_size)))),
-            dirty: false,
-            dirty_regions: DirtyRegions::new(),
-        }
-    }
-
-    pub fn new_on_disk() -> Self {
-        Self {
-            content: FileContent::Mirrored,
-            dirty: false,
-            dirty_regions: DirtyRegions::new(),
+            blocks: Arc::new(RwLock::new(blocks_inner)),
         }
     }
 }
@@ -210,14 +316,7 @@ impl Node {
     pub fn new_file(attr: FileAttr, block_size: usize) -> Self {
         Self {
             attr,
-            kind: NodeKind::File(File::new(block_size)),
-        }
-    }
-
-    pub fn new_file_on_disk(attr: FileAttr) -> Self {
-        Self {
-            attr,
-            kind: NodeKind::File(File::new_on_disk()),
+            kind: NodeKind::File(File::new(block_size, attr.size)),
         }
     }
 
@@ -228,7 +327,7 @@ impl Node {
         }
     }
 
-    pub fn new_directory_on_disk(attr: FileAttr) -> Self {
+    pub fn new_directory_mirrored(attr: FileAttr) -> Self {
         Self {
             attr,
             kind: NodeKind::Directory(DirectoryKind::Mirrored),

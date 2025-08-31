@@ -1,16 +1,11 @@
 use std::{
-    collections::HashMap,
-    ffi::OsString,
-    fmt::Debug,
-    fs,
-    os::unix::fs::{chown, symlink, PermissionsExt, FileExt},
-    path::{Path, PathBuf},
-    sync::{
-        mpsc::{self, Sender},
-        Arc, Condvar, RwLock,
-    },
-    thread::{self, JoinHandle},
+    collections::HashMap, ffi::OsString, fmt::Debug, fs, os::unix::fs::{chown, symlink, FileExt, PermissionsExt}, path::{Path, PathBuf}, sync::{
+        mpsc::{self, Sender}, Arc, RwLock
+    }, thread::{self, JoinHandle}
 };
+
+#[cfg(test)]
+use std::sync::Condvar;
 
 use std::os::unix::fs::MetadataExt;
 use std::time::SystemTime;
@@ -18,7 +13,7 @@ use std::time::SystemTime;
 use fuser::{FileAttr, FileType};
 use libc::{c_int, ENOENT};
 use log::{debug, info};
-use crate::{lru_cache::LruManager, node::{FileContent, NodeKind, Nodes}};
+use crate::{lru_cache::{BlockEviction, LruManager}, node::{block_ranges, NodeKind, Nodes}};
 
 pub(crate) type Result<T> = std::result::Result<T, c_int>;
 
@@ -107,6 +102,13 @@ pub enum WriteJob {
         new_parent: u64,
         new_name: OsString,
     },
+    Evict {
+        evictions: Vec<BlockEviction>,
+    },
+    #[cfg(test)]
+    Sync {
+        condvar: Arc<Condvar>
+    },
     Shutdown,
 }
 
@@ -119,8 +121,8 @@ impl MirrorWorker {
     pub fn new(
         mirror: Arc<dyn Mirror + Send + Sync>,
         nodes: Arc<RwLock<Nodes>>,
-        lru_manager: Arc<LruManager>,
-        cache_cond: Arc<Condvar>,
+        block_size: usize,
+        lru_manager: Arc<LruManager>
     ) -> Self {
         let (tx, rx) = mpsc::channel::<WriteJob>();
 
@@ -130,7 +132,7 @@ impl MirrorWorker {
                 if matches!(job, WriteJob::Shutdown) {
                     break;
                 }
-                if let Err(e) = Self::handle_job(&worker_mirror, &nodes, &lru_manager, job, &cache_cond) {
+                if let Err(e) = Self::handle_job(&worker_mirror, &nodes, block_size, &lru_manager, job) {
                     debug!("Failed to execute write job: {e:?}");
                 }
             }
@@ -146,9 +148,9 @@ impl MirrorWorker {
     fn handle_job(
         mirror: &Arc<dyn Mirror + Send + Sync>,
         nodes: &Arc<RwLock<Nodes>>,
+        block_size: usize,
         lru_manager: &Arc<LruManager>,
         job: WriteJob,
-        cache_cond: &Arc<Condvar>,
     ) -> std::io::Result<()> {
         debug!("Executing job: {job:?}");
         let path_resolver = PathResolver::new(nodes);
@@ -169,7 +171,7 @@ impl MirrorWorker {
                 mirror.create_symlink(ino, parent, &name, &target, &attr, &path_resolver)?;
             }
             WriteJob::Write { ino } => {
-                let (data_to_write, regions) = {
+                let blocks = {
                     let mut nodes = nodes.write().unwrap();
                     let node = match nodes.get_mut(ino) {
                         Ok(n) => n,
@@ -177,36 +179,22 @@ impl MirrorWorker {
                     };
 
                     if let NodeKind::File(file) = &mut node.kind {
-                        if !file.dirty {
-                            return Ok(());
-                        }
-                        file.dirty = false;
-                        let regions = file.dirty_regions.regions().clone();
-                        file.dirty_regions.clear();
-                        if let FileContent::InMemory(data) = &file.content {
-                            (Some(data.clone()), regions)
-                        } else {
-                            (None, regions)
-                        }
+                        file.blocks.clone()
                     } else {
                         return Ok(());
                     }
                 };
 
-                if let Some(data) = data_to_write {
-                    let data = data.read().unwrap();
-                    for (start, end) in regions {
-                        let start = start as u64;
-                        let end = end as u64;
-                        if end > data.length {
-                            continue;
-                        }
-                        let data_to_write = data.read(start, (end - start) as u32);
-                        mirror.write(ino, &data_to_write, start, &path_resolver)?;
+                let mut blocks = blocks.write().unwrap();
+                let dirty_regions_clone = blocks.dirty_regions.clone();
+                for &(start, end) in dirty_regions_clone.regions() {
+                    for (offset, block_index, block_start, block_end) in block_ranges(start, end, block_size) {
+                        let block = blocks.get_block(block_index);
+                        mirror.write(ino, &block[block_start..block_end], offset, &path_resolver)?;
+                        blocks.dirty_regions.remove_region(start, end);
+                        lru_manager.mark_as_clean(ino, block_index);
                     }
                 }
-                lru_manager.mark_as_clean(ino);
-                cache_cond.notify_all();
             }
             WriteJob::SetAttr { ino, attr } => {
                 mirror.set_attr(ino, &attr, Some(attr.size), &path_resolver)?;
@@ -230,7 +218,24 @@ impl MirrorWorker {
             } => {
                 mirror.link(ino, new_parent, &new_name, &path_resolver)?;
             }
-            WriteJob::Shutdown => {}
+            WriteJob::Evict { evictions } => {
+                for eviction in evictions.iter() {
+                    let mut nodes = nodes.write().unwrap();
+                    if let Ok(node) = nodes.get_mut(eviction.ino) {
+                        if let NodeKind::File(file) = &mut node.kind {
+                            let mut blocks = file.blocks.write().unwrap();
+                            blocks.evict_version(eviction.block, eviction.version);
+                        }
+                    } // ignore pending evictions for removed nodes
+                }
+            }
+            #[cfg(test)]
+            WriteJob::Sync { condvar } => {
+                condvar.notify_all();
+            }
+            WriteJob::Shutdown => {
+                // Nothing to do. The dispatch loop will terminate instead of calling handle_job
+            }
         }
         Ok(())
     }
@@ -261,7 +266,6 @@ pub trait Mirror: Debug {
         path_resolver: &PathResolver<'a>,
     ) -> std::io::Result<Vec<MirrorDirEntry>>;
     fn read_link<'a>(&self, ino: u64, path_resolver: &PathResolver<'a>) -> std::io::Result<PathBuf>;
-    fn read_file<'a>(&self, ino: u64, path_resolver: &PathResolver<'a>) -> std::io::Result<Vec<u8>>;
     fn create_file<'a>(
         &self,
         ino: u64,
@@ -294,6 +298,13 @@ pub trait Mirror: Debug {
         offset: u64,
         path_resolver: &PathResolver<'a>,
     ) -> std::io::Result<()>;
+    fn read<'a>(
+        &self,
+        ino: u64,
+        data: &mut [u8],
+        offset: u64,
+        path_resolver: &PathResolver<'a>
+    ) -> std::io::Result<usize>;
     fn set_attr<'a>(
         &self,
         ino: u64,
@@ -407,12 +418,6 @@ impl Mirror for LocalMirror {
         fs::read_link(fs_path)
     }
 
-    fn read_file<'a>(&self, ino: u64, path_resolver: &PathResolver<'a>) -> std::io::Result<Vec<u8>> {
-        let path = path_resolver.resolve(ino)?;
-        let fs_path = self.get_fs_path(&path);
-        fs::read(fs_path)
-    }
-
     fn create_file<'a>(
         &self,
         _ino: u64,
@@ -464,6 +469,19 @@ impl Mirror for LocalMirror {
         }
         symlink(target, &fs_path)?;
         chown(&fs_path, Some(attr.uid), Some(attr.gid))
+    }
+
+    fn read<'a>(
+        &self,
+        ino: u64,
+        data: &mut [u8],
+        offset: u64,
+        path_resolver: &PathResolver<'a>
+    ) -> std::io::Result<usize> {
+        let path = path_resolver.resolve(ino)?;
+        let fs_path = self.get_fs_path(&path);
+        let file = fs::OpenOptions::new().read(true).open(&fs_path)?;
+        file.read_at(data, offset)
     }
 
     fn write<'a>(

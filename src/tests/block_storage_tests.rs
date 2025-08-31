@@ -4,8 +4,11 @@ use crate::node::FileBlocks;
 fn test_write_read_single_block() {
     let mut file_blocks = FileBlocks::new(1024);
     let data = "hello world".as_bytes();
-    file_blocks.write(0, data);
-    let read_data = file_blocks.read(0, data.len() as u32);
+    let len = data.len();
+    file_blocks.extend_to(len as u64);
+    let dest = file_blocks.get_block_mut(0);
+    dest[0..len].copy_from_slice(data);
+    let read_data = file_blocks.get_block(0);
     assert_eq!(data, read_data.as_slice());
 }
 
@@ -13,44 +16,28 @@ fn test_write_read_single_block() {
 fn test_write_read_multiple_blocks() {
     let mut file_blocks = FileBlocks::new(1024);
     let mut data = Vec::new();
+    file_blocks.extend_to(2048);
     for i in 0..2048 {
         data.push((i % 256) as u8);
     }
-    file_blocks.write(0, &data);
-    let read_data = file_blocks.read(0, data.len() as u32);
-    assert_eq!(data, read_data);
+    let dest1 = file_blocks.get_block_mut(0);
+    dest1[0..1024].copy_from_slice(&data[0..1024]);
+    let dest2 = file_blocks.get_block_mut(1);
+    dest2[0..1024].copy_from_slice(&data[1024..2048]);
+    let read1 = file_blocks.get_block(0);
+    assert_eq!(&data[0..1024], &read1[..]);
+    let read2 = file_blocks.get_block(1);
+    assert_eq!(&data[1024..2048], &read2[..]);
 }
-
-#[test]
-fn test_write_read_with_offset() {
-    let mut file_blocks = FileBlocks::new(1024);
-    let mut data = Vec::new();
-    for i in 0..2048 {
-        data.push((i % 256) as u8);
-    }
-    file_blocks.write(512, &data);
-    let read_data = file_blocks.read(512, data.len() as u32);
-    assert_eq!(data, read_data);
-}
-
-#[test]
-fn test_overwrite() {
-    let mut file_blocks = FileBlocks::new(1024);
-    let initial_data = "hello world".as_bytes();
-    file_blocks.write(0, initial_data);
-    let new_data = "goodbye".as_bytes();
-    file_blocks.write(6, new_data);
-    let read_data = file_blocks.read(0, "hello goodbye".len() as u32);
-    assert_eq!("hello goodbye", String::from_utf8(read_data).unwrap());
-}
-
 #[test]
 fn test_block_truncate() {
     let mut file_blocks = FileBlocks::new(1024);
     let data = "hello world".as_bytes();
-    file_blocks.write(0, data);
-    file_blocks.truncate(5);
-    let read_data = file_blocks.read(0, 5);
+    file_blocks.extend_to(data.len() as u64);
+    let dest = file_blocks.get_block_mut(0);
+    dest[..].copy_from_slice(data);
+    file_blocks.truncate_to(5);
+    let read_data = file_blocks.get_block(0);
     assert_eq!("hello".as_bytes(), read_data.as_slice());
-    assert_eq!(5, file_blocks.length);
+    assert_eq!(5, file_blocks.size);
 }

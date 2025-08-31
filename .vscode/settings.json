@@ -7,8 +7,10 @@
         "crtime",
         "EEXIST",
         "ENOENT",
+        "ENOSPC",
         "ENOSYS",
         "ENOTDIR",
+        "errno",
         "fsyncdir",
         "fuser",
         "getattr",
@@ -22,6 +24,7 @@
         "nlink",
         "nlookup",
         "NOREPLACE",
+        "ntest",
         "ondisk",
         "opendir",
         "rdev",
@@ -33,6 +36,7 @@
         "setxattr",
         "statfs",
         "threadpool",
+        "unrealize",
         "Xattr"
     ]
 }
